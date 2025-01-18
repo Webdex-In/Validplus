@@ -1,0 +1,4161 @@
+File: app.py
+
+from flask import Flask, request, jsonify, render_template
+from email_verifier import EmailVerifier
+from quick_email_verifier import QuickEmailVerifier
+from rate_limiter import rate_limiter
+from functools import wraps
+import time
+import logging
+from logging.handlers import RotatingFileHandler
+import traceback
+import os
+from config import (
+    FLASK_CONFIG,
+    LOG_CONFIG,
+    DNS_CONFIG,
+    SMTP_CONFIG,
+    ERROR_MESSAGES
+)
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# Configure logging
+handler = RotatingFileHandler(
+    LOG_CONFIG['FILENAME'],
+    maxBytes=LOG_CONFIG['MAX_BYTES'],
+    backupCount=LOG_CONFIG['BACKUP_COUNT']
+)
+handler.setFormatter(logging.Formatter(LOG_CONFIG['LOG_FORMAT']))
+handler.setLevel(LOG_CONFIG['LOG_LEVEL'])
+app.logger.addHandler(handler)
+app.logger.setLevel(LOG_CONFIG['LOG_LEVEL'])
+
+# Initialize verifiers
+quick_verifier = QuickEmailVerifier()
+detailed_verifier = EmailVerifier()
+
+def rate_limit_handler(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Get client IP
+        ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+
+        # Get domain from email (if present in request)
+        domain = ''
+        if request.is_json and 'email' in request.json:
+            try:
+                domain = request.json['email'].split('@')[1]
+            except:
+                domain = 'invalid-domain'
+
+        # Check rate limits
+        allowed, limit_type, retry_after = rate_limiter.check_rate_limit(domain, ip)
+
+        if not allowed:
+            # Get remaining quotas for response
+            quotas = rate_limiter.get_remaining_quota(domain, ip)
+
+            response = {
+                'error': ERROR_MESSAGES['RATE_LIMIT'],
+                'limit_type': limit_type,
+                'retry_after': int(retry_after),
+                'quotas': quotas
+            }
+
+            headers = {
+                'X-RateLimit-Retry-After': str(int(retry_after)),
+                'X-RateLimit-Reset': str(int(time.time() + retry_after)),
+            }
+
+            app.logger.warning(f"Rate limit exceeded - Type: {limit_type}, IP: {ip}, Domain: {domain}")
+            return jsonify(response), 429, headers
+
+        # Add rate limit headers to response
+        def add_headers(response):
+            quotas = rate_limiter.get_remaining_quota(domain, ip)
+
+            for limit_type, quota in quotas.items():
+                response.headers[f'X-RateLimit-{limit_type.title()}-Remaining'] = str(quota['remaining_requests'])
+                response.headers[f'X-RateLimit-{limit_type.title()}-Reset'] = str(int(time.time() + quota['window_remaining']))
+
+            return response
+
+        # Call the original route function
+        response = f(*args, **kwargs)
+
+        # Add headers to response
+        if isinstance(response, tuple):
+            response = (add_headers(response[0]), *response[1:])
+        else:
+            response = add_headers(response)
+
+        return response
+
+    return decorated_function
+
+@app.route('/')
+def home():
+    """Render the home page"""
+    return render_template('index.html')
+
+@app.route('/validate', methods=['POST'])
+@rate_limit_handler
+def validate():
+    """Email validation endpoint with rate limiting"""
+    try:
+        email = request.json.get('email')
+        validation_type = request.json.get('type', 'quick')
+
+        if not email:
+            return jsonify({'error': ERROR_MESSAGES['INVALID_EMAIL']}), 400
+
+        app.logger.info(f"Starting {validation_type} validation for email: {email}")
+        start_time = time.time()
+
+        if validation_type == 'quick':
+            try:
+                domain = email.split('@')[1]
+                # Get domain info first
+                # Get domain info first with detailed validation
+                domain_info = quick_verifier._validate_domain_enhanced(domain)
+                # Verify email with careful catch-all check
+                smtp_info = {'is_valid': False, 'mx_info': {}}
+                if domain_info['is_valid'] and domain_info['mx_records']:
+                    # First check if the actual email exists
+                    smtp_info = quick_verifier._verify_smtp_enhanced(email, domain_info['mx_records'])
+                    # Only do catch-all test if the email exists
+                    if smtp_info['is_valid']:
+                        # Test with a definitely non-existent email
+                        test_email = f"nonexistent_{int(time.time())}@{domain}"
+                        test_result = quick_verifier._verify_smtp_enhanced(test_email, domain_info['mx_records'])
+                        domain_info['is_catch_all'] = test_result['is_valid']
+                    else:
+                        domain_info['is_catch_all'] = False
+                # Then verify email for additional checks
+                result = quick_verifier.verify_email(email)
+
+                # Update result status based on catch-all status
+                if domain_info['is_catch_all']:
+                    result.status = "Valid - But Catch-all (Use Caution)"
+                elif result.is_valid:
+                    result.status = "Valid - OK to Send"
+
+                response_data = {
+                    'is_valid': result.is_valid,
+                    'format_valid': result.format_valid,
+                    'domain_valid': domain_info['is_valid'],
+                    'mailbox_exists': smtp_info['is_valid'],
+                    'is_role_account': result.is_role_account,
+                    'is_disposable': result.is_disposable,
+                    'is_catch_all': domain_info['is_catch_all'],
+                    'is_free_email': result.is_free_email,
+                    'is_honeypot': result.is_honeypot,
+                    'has_valid_syntax': result.has_valid_syntax,
+                    'has_parked_mx': domain_info['is_parked'],
+                    'has_valid_smtp': smtp_info['is_valid'],
+                    'verification_time': result.verification_time,
+                    'status': result.status,
+                    'details': result.details,
+                    'suggestions': result.suggestions,
+                    'mx_info': smtp_info['mx_info'],
+                    'domain_info': domain_info
+                }
+            except Exception as e:
+                app.logger.error(f"Error in quick verification: {str(e)}\n{traceback.format_exc()}")
+                return jsonify({
+                    'error': str(e),
+                    'status': 'Error'
+                }), 500
+
+            return jsonify(response_data)
+        else:
+            try:
+                result = detailed_verifier.verify_email(email)
+                response_data = {
+                    'is_valid': result.is_valid,
+                    'format_valid': result.format_valid,
+                    'syntax_checks': result.syntax_checks,
+                    'mx_check': {
+                        'has_valid_mx': result.mx_check.has_valid_mx,
+                        'mx_records': result.mx_check.mx_records,
+                        'response_time': result.mx_check.response_time,
+                        'accepts_all': result.mx_check.accepts_all,
+                        'has_catch_all': result.mx_check.has_catch_all,
+                        'port_open': result.mx_check.port_open
+                    },
+                    'smtp_check': result.smtp_check,
+                    'is_disposable': result.is_disposable,
+                    'is_role_account': result.is_role_account,
+                    'is_free_email': result.is_free_email,
+                    'dns_security': result.dns_security.__dict__,
+                    'security_checks': result.security_checks.__dict__,
+                    'suggestions': result.suggestions,
+                    'score': result.score.__dict__,
+                    'total_time': time.time() - start_time
+                }
+            except Exception as e:
+                app.logger.error(f"Error in detailed verification: {str(e)}\n{traceback.format_exc()}")
+                return jsonify({
+                    'error': str(e),
+                    'score': {
+                        'score': 0,
+                        'verdict': 'Error',
+                        'details': [str(e)],
+                        'confidence': 'None',
+                        'verification_time': 0
+                    }
+                }), 500
+
+            app.logger.info(f"Completed {validation_type} validation for {email} in {time.time() - start_time:.2f}s")
+            return jsonify(response_data)
+
+    except Exception as e:
+        app.logger.error(f"Error validating email {email if email else 'unknown'}: {str(e)}\n{traceback.format_exc()}")
+        return jsonify({
+            'error': str(e),
+            'score': {
+                'score': 0,
+                'verdict': 'Error',
+                'details': [str(e)],
+                'confidence': 'None',
+                'verification_time': 0
+            }
+        }), 500
+
+@app.route('/health')
+@rate_limit_handler
+def health_check():
+    """Health check endpoint with rate limiting"""
+    return jsonify({'status': 'healthy'}), 200
+
+@app.route('/quota', methods=['GET'])
+@rate_limit_handler
+def get_quota():
+    """Endpoint to check current rate limit quotas"""
+    ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+    domain = request.args.get('domain', 'example.com')
+
+    quotas = rate_limiter.get_remaining_quota(domain, ip)
+    return jsonify({
+        'quotas': quotas,
+        'ip': ip
+    })
+
+# Error handlers
+@app.errorhandler(404)
+def not_found_error(error):
+    return jsonify({'error': 'Not Found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    app.logger.error(f'Server Error: {error}\n{traceback.format_exc()}')
+    return jsonify({'error': 'Internal Server Error'}), 500
+
+@app.errorhandler(429)
+def ratelimit_handler(error):
+    return jsonify({'error': 'Rate limit exceeded'}), 429
+
+if __name__ == '__main__':
+    app.logger.info("Starting Email Validation Service")
+    app.run(
+        host=FLASK_CONFIG['HOST'],
+        port=FLASK_CONFIG['PORT'],
+        debug=FLASK_CONFIG['DEBUG']
+    )
+----------------------------------------
+
+File: catch_all_detector.py
+
+from typing import List, Dict, Tuple, Optional
+import random
+import string
+import time
+from dataclasses import dataclass
+import logging
+import hashlib
+from collections import defaultdict
+import re
+
+@dataclass
+class CatchAllResult:
+    """Detailed catch-all detection result"""
+    is_catch_all: bool
+    confidence: float  # 0-1
+    detection_method: str
+    response_patterns: Dict[str, bool]
+    server_behavior: str
+    verified_patterns: List[str]
+    verification_time: float
+    smtp_responses: Dict[str, List[int]]
+
+class AdvancedCatchAllDetector:
+    def __init__(self):
+        self.logger = logging.getLogger('catch_all_detector')
+        self._init_test_patterns()
+        self._response_cache = defaultdict(dict)
+
+    def _init_test_patterns(self):
+        """Initialize sophisticated test patterns"""
+        self.test_patterns = {
+            'standard': [
+                self._generate_standard_pattern,
+                self._generate_uuid_pattern,
+                self._generate_timestamp_pattern
+            ],
+            'format_specific': [
+                self._generate_role_like_pattern,
+                self._generate_service_like_pattern,
+                self._generate_person_like_pattern
+            ],
+            'edge_cases': [
+                self._generate_special_char_pattern,
+                self._generate_long_pattern,
+                self._generate_numeric_pattern
+            ]
+        }
+
+        # Known patterns that often bypass catch-all detection
+        self.bypass_patterns = [
+            'postmaster', 'abuse', 'spam', 'admin', 'webmaster',
+            'hostmaster', 'administrator', 'root', 'support', 'noreply'
+        ]
+
+        # Patterns that often indicate true catch-all
+        self.indicator_patterns = [
+            r'^test[\d]*@',
+            r'^verify[\d]*@',
+            r'^check[\d]*@',
+            r'^invalid[\d]*@'
+        ]
+
+    def _generate_standard_pattern(self, domain: str) -> str:
+        """Generate random but realistic-looking email pattern"""
+        random_string = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+        hash_suffix = hashlib.md5(str(time.time()).encode()).hexdigest()[:6]
+        return f"verify.{random_string}.{hash_suffix}@{domain}"
+
+    def _generate_uuid_pattern(self, domain: str) -> str:
+        """Generate UUID-based pattern"""
+        import uuid
+        return f"check.{str(uuid.uuid4())[:12]}@{domain}"
+
+    def _generate_timestamp_pattern(self, domain: str) -> str:
+        """Generate timestamp-based pattern with noise"""
+        timestamp = int(time.time())
+        noise = ''.join(random.choices(string.ascii_lowercase, k=4))
+        return f"test.{timestamp}.{noise}@{domain}"
+
+    def _generate_role_like_pattern(self, domain: str) -> str:
+        """Generate patterns that look like role accounts"""
+        roles = ['support', 'info', 'contact', 'sales', 'help']
+        suffix = ''.join(random.choices(string.digits, k=4))
+        role = random.choice(roles)
+        return f"{role}.nonexistent.{suffix}@{domain}"
+
+    def _generate_service_like_pattern(self, domain: str) -> str:
+        """Generate patterns that look like service accounts"""
+        services = ['newsletter', 'notification', 'alert', 'system', 'monitor']
+        suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        service = random.choice(services)
+        return f"{service}.{suffix}@{domain}"
+
+    def _generate_person_like_pattern(self, domain: str) -> str:
+        """Generate patterns that look like personal emails"""
+        first_names = ['john', 'jane', 'bob', 'alice', 'david']
+        last_names = ['smith', 'doe', 'jones', 'brown', 'wilson']
+        first = random.choice(first_names)
+        last = random.choice(last_names)
+        suffix = ''.join(random.choices(string.digits, k=4))
+        return f"{first}.{last}.{suffix}@{domain}"
+
+    def _generate_special_char_pattern(self, domain: str) -> str:
+        """Generate patterns with special characters"""
+        chars = '.-_+'
+        base = ''.join(random.choices(string.ascii_lowercase, k=8))
+        special = random.choice(chars)
+        return f"test{special}{base}@{domain}"
+
+    def _generate_long_pattern(self, domain: str) -> str:
+        """Generate very long local-part"""
+        return f"{'x' * 50}@{domain}"
+
+    def _generate_numeric_pattern(self, domain: str) -> str:
+        """Generate numeric patterns"""
+        nums = ''.join(random.choices(string.digits, k=10))
+        return f"test.{nums}@{domain}"
+
+    def detect_catch_all(self, domain: str, mx_records: List[str], smtp_verifier) -> CatchAllResult:
+        """
+        Advanced catch-all detection with multiple strategies
+
+        Args:
+            domain: Domain to test
+            mx_records: List of MX records
+            smtp_verifier: Function to verify email via SMTP
+        """
+        start_time = time.time()
+        responses = defaultdict(list)
+        verified_patterns = []
+
+        # Test special patterns first
+        bypass_results = self._test_bypass_patterns(domain, mx_records, smtp_verifier, responses)
+        if bypass_results is not None:
+            return bypass_results
+
+        # Test patterns in stages
+        test_results = {
+            'standard': self._test_pattern_group('standard', domain, mx_records, smtp_verifier, responses),
+            'format': self._test_pattern_group('format_specific', domain, mx_records, smtp_verifier, responses),
+            'edge': self._test_pattern_group('edge_cases', domain, mx_records, smtp_verifier, responses)
+        }
+
+        # Analyze responses to determine catch-all status
+        is_catch_all, confidence, method = self._analyze_results(test_results, responses)
+
+        # Determine server behavior pattern
+        server_behavior = self._determine_server_behavior(responses)
+
+        verification_time = time.time() - start_time
+
+        return CatchAllResult(
+            is_catch_all=is_catch_all,
+            confidence=confidence,
+            detection_method=method,
+            response_patterns=test_results,
+            server_behavior=server_behavior,
+            verified_patterns=verified_patterns,
+            verification_time=verification_time,
+            smtp_responses=dict(responses)
+        )
+
+    def _test_bypass_patterns(self, domain: str, mx_records: List[str], 
+                            smtp_verifier, responses: Dict) -> Optional[CatchAllResult]:
+        """Test for patterns that might bypass normal catch-all"""
+        for pattern in self.bypass_patterns:
+            email = f"{pattern}@{domain}"
+            result = smtp_verifier(email, mx_records)
+            is_valid = self._extract_validity(result)
+            responses['bypass'].append(is_valid)
+
+            # If all bypass patterns are accepted, likely a catch-all
+            if all(responses['bypass']):
+                return CatchAllResult(
+                    is_catch_all=True,
+                    confidence=0.95,
+                    detection_method="bypass_pattern",
+                    response_patterns={'bypass': True},
+                    server_behavior="accepts_all_standard_patterns",
+                    verified_patterns=self.bypass_patterns,
+                    verification_time=0.0,
+                    smtp_responses=dict(responses)
+                )
+        return None
+
+    def _test_pattern_group(self, group: str, domain: str, mx_records: List[str],
+                           smtp_verifier, responses: Dict) -> bool:
+        """Test a group of patterns"""
+        results = []
+        for pattern_generator in self.test_patterns[group]:
+            email = pattern_generator(domain)
+            result = smtp_verifier(email, mx_records)
+            is_valid = self._extract_validity(result)
+            responses[group].append(is_valid)
+            results.append(is_valid)
+        return any(results)
+
+    def _analyze_results(self, test_results: Dict, responses: Dict) -> Tuple[bool, float, str]:
+        """Analyze test results to determine catch-all status"""
+        # Count positive responses
+        standard_positives = sum(1 for x in responses['standard'] if x)
+        format_positives = sum(1 for x in responses['format_specific'] if x)
+        edge_positives = sum(1 for x in responses['edge_cases'] if x)
+
+        total_tests = len(responses['standard']) + len(responses['format_specific']) + len(responses['edge_cases'])
+        positive_ratio = (standard_positives + format_positives + edge_positives) / total_tests
+
+        # Determine catch-all status and confidence
+        if positive_ratio > 0.8:
+            return True, 0.95, "high_acceptance"
+        elif positive_ratio > 0.6:
+            return True, 0.8, "moderate_acceptance"
+        elif positive_ratio > 0.4:
+            return True, 0.6, "potential_catch_all"
+        elif standard_positives > 0:
+            return True, 0.4, "selective_catch_all"
+        else:
+            return False, 0.9, "standard_rejection"
+
+    def _determine_server_behavior(self, responses: Dict) -> str:
+        """Analyze server behavior patterns"""
+        if all(responses.get('bypass', [])):
+            return "accepts_standard_patterns"
+        elif all(responses.get('standard', [])):
+            return "accepts_all_random"
+        elif any(responses.get('edge_cases', [])):
+            return "accepts_edge_cases"
+        elif any(responses.get('format_specific', [])):
+            return "selective_acceptance"
+        else:
+            return "strict_rejection"
+
+    def _extract_validity(self, result) -> bool:
+        """Extract validity from SMTP verification result"""
+        if isinstance(result, dict):
+            return result.get('is_valid', False)
+        return bool(result)
+----------------------------------------
+
+File: config.py
+
+import os
+from typing import Set, Dict, Any, Union
+
+# Flask Configuration
+FLASK_CONFIG = {
+    'HOST': os.getenv('HOST', '0.0.0.0'),
+    'PORT': int(os.getenv('PORT', 8080)),
+    'DEBUG': False,  # Always False in production
+    'TESTING': False,
+    'JSONIFY_PRETTYPRINT_REGULAR': False,  # Better performance in production
+    'MAX_CONTENT_LENGTH': 1 * 1024 * 1024,  # 1MB max-limit
+    'PREFERRED_URL_SCHEME': 'https'
+}
+
+# Logging Configuration
+LOG_CONFIG = {
+    'FILENAME': 'email_validator.log',
+    'MAX_BYTES': 10 * 1024 * 1024,  # 10MB
+    'BACKUP_COUNT': 5,
+    'LOG_FORMAT': '%(asctime)s - %(name)s - %(levelname)s - %(message)s - [%(filename)s:%(lineno)d]',
+    'LOG_LEVEL': 'INFO'
+}
+
+# Rate Limiting Configuration
+RATE_LIMITS = {
+    'GLOBAL': {
+        'requests': 100000,  # Increased for production
+        'window': 3600
+    },
+    'DOMAIN': {
+        'requests': 5000,  
+        'window': 3600
+    },
+    'IP': {
+        'requests': 10000,  
+        'window': 3600
+    },
+    'DOMAIN_IP': {
+        'requests': 2000,
+        'window': 3600
+    }
+}
+
+# DNS Configuration
+DNS_CONFIG = {
+    'NAMESERVERS': [
+        '8.8.8.8',    # Google DNS
+        '1.1.1.1',    # Cloudflare DNS
+        '9.9.9.9',    # Quad9
+        '208.67.222.222'  # OpenDNS
+    ],
+    'TIMEOUT': 5,
+    'LIFETIME': 10,
+    'CACHE_TTL': 300,      # 5 minutes
+    'CACHE_MAXSIZE': 10000,  # Increased for production
+    'RETRY_COUNT': 3,
+    'RETRY_TIMEOUT': 1    # 1 second between retries
+}
+
+# SMTP Configuration
+SMTP_CONFIG = {
+    'TIMEOUT': 7,
+    'MAX_CONNECTIONS': 50,  # Increased for production
+    'CONNECTION_TIMEOUT': 5,
+    'MAX_AGE': 300,  # 5 minutes
+    'RETRY_COUNT': 2,
+    'RETRY_DELAY': 1,
+    'DEFAULT_PORTS': [25, 587, 465]
+}
+
+# Role-Based Email Accounts
+ROLE_ACCOUNTS: Set[str] = {
+    # Administrative
+    'admin', 'administrator', 'hostmaster', 'postmaster', 'webmaster',
+
+    # Support and Service
+    'support', 'help', 'helpdesk', 'service', 'customercare', 'care',
+    'customersupport', 'technical', 'tech',
+
+    # Information and Contact
+    'info', 'information', 'contact', 'enquiries', 'inquiries', 'feedback',
+
+    # Business Functions
+    'sales', 'marketing', 'billing', 'finance', 'accounts', 'accounting',
+    'payroll', 'invoice', 'orders', 'shipping', 'legal', 'compliance',
+
+    # Human Resources
+    'hr', 'recruitment', 'careers', 'jobs', 'hiring',
+
+    # No-Reply and Automated
+    'noreply', 'no-reply', 'no.reply', 'donotreply', 'do-not-reply',
+    'automated', 'auto', 'daemon', 'mailer', 'mailerdaemon',
+
+    # Communications
+    'press', 'media', 'communications', 'pr', 'newsletter', 'news',
+
+    # Development and API
+    'developer', 'dev', 'api', 'development', 'engineering',
+
+    # Office and Team
+    'office', 'team', 'staff', 'management'
+}
+
+# Disposable Email Domains
+DISPOSABLE_DOMAINS: Set[str] = {
+    # Major Disposable Services
+    'tempmail.com', '10minutemail.com', 'throwawaymail.com',
+    'mailinator.com', 'guerrillamail.com', 'yopmail.com',
+    'temp-mail.org', 'trashmail.com', 'sharklasers.com',
+
+    # Additional Services
+    'tempmail.net', 'disposablemail.com', 'wegwerfemail.de',
+    'throwawaymail.net', 'minutemail.com', 'tempmailaddress.com',
+    'fakeinbox.com', 'mailnesia.com', 'tempr.email',
+
+    # Variants
+    'guerrillamail.net', 'guerrillamail.org', 'guerrillamailblock.com',
+    'mailinator.net', 'mailinator.org', 'mailinator.info',
+    'yopmail.fr', 'yopmail.net', 'cool.fr.nf', 'jetable.org'
+}
+
+# Free Email Providers
+FREE_EMAIL_PROVIDERS: Set[str] = {
+    # Global Providers
+    'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com',
+    'aol.com', 'protonmail.com', 'icloud.com', 'zoho.com',
+    'mail.com', 'yandex.com', 'gmx.com', 'tutanota.com',
+
+    # Regional Variants
+    'yahoo.co.uk', 'yahoo.co.in', 'yahoo.co.jp', 'yahoo.fr',
+    'outlook.fr', 'outlook.de', 'outlook.jp', 'outlook.it',
+
+    # Microsoft Services
+    'hotmail.co.uk', 'hotmail.fr', 'hotmail.de', 'live.com',
+    'msn.com', 'passport.com',
+
+    # Additional Providers
+    'mail.ru', 'rambler.ru', 'yandex.ru', 'qq.com',
+    '163.com', '126.com', 'yeah.net', 'web.de'
+}
+
+# Blacklists for spam checking
+BLACKLISTS: list[str] = [
+    # Major blacklist providers
+    'zen.spamhaus.org',
+    'sbl.spamhaus.org',
+    'xbl.spamhaus.org',
+    'pbl.spamhaus.org',
+    'bl.spamcop.net',
+    'dnsbl.sorbs.net',
+    'b.barracudacentral.org',
+
+    # Additional SORBS lists
+    'spam.dnsbl.sorbs.net',
+    'recent.spam.dnsbl.sorbs.net',
+    'new.spam.dnsbl.sorbs.net',
+    'old.spam.dnsbl.sorbs.net',
+
+    # Other major DNSBLs
+    'dnsbl.dronebl.org',
+    'dnsbl.inps.de',
+    'ix.dnsbl.manitu.net',
+    'psbl.surriel.com'
+]
+
+# Error Messages
+ERROR_MESSAGES = {
+    'INVALID_EMAIL': 'Invalid email format',
+    'DOMAIN_NOT_FOUND': 'Domain does not exist',
+    'NO_MX_RECORDS': 'No valid MX records found for domain',
+    'DISPOSABLE_EMAIL': 'Disposable email addresses are not allowed',
+    'ROLE_ACCOUNT': 'Role-based email accounts are not allowed',
+    'SMTP_ERROR': 'Unable to verify email existence',
+    'RATE_LIMIT': 'Rate limit exceeded. Please try again later.',
+    'SERVER_ERROR': 'An unexpected error occurred'
+}
+
+# Validation Rules
+VALIDATION_RULES = {
+    'MAX_EMAIL_LENGTH': 254,
+    'MAX_LOCAL_PART_LENGTH': 64,
+    'MAX_DOMAIN_LENGTH': 255,
+    'MIN_DOMAIN_SEGMENTS': 2,
+    'ALLOWED_SPECIAL_CHARS': '.-_+',
+    'RESTRICTED_LOCAL_CHARS': '<>()[]\\,;:@ '
+}
+----------------------------------------
+
+File: dns_cache.py
+
+from functools import wraps
+from cachetools import TTLCache
+from typing import Dict, Any, Optional, List, Union
+import dns.resolver
+import dns.exception
+import time
+import logging
+from threading import Lock
+from config import DNS_CONFIG
+
+class DNSCache:
+    """DNS caching utility with enhanced error handling and monitoring"""
+
+    def __init__(self, ttl: int = DNS_CONFIG['CACHE_TTL'], 
+                 maxsize: int = DNS_CONFIG['CACHE_MAXSIZE']):
+        """
+        Initialize DNS cache
+
+        Args:
+            ttl: Time to live for cache entries in seconds
+            maxsize: Maximum number of entries in cache
+        """
+        self._cache = TTLCache(maxsize=maxsize, ttl=ttl)
+        self._lock = Lock()
+        self.resolver = dns.resolver.Resolver()
+
+        # Configure resolver from settings
+        self.resolver.nameservers = DNS_CONFIG['NAMESERVERS']
+        self.resolver.timeout = DNS_CONFIG['TIMEOUT']
+        self.resolver.lifetime = DNS_CONFIG['LIFETIME']
+
+        # Initialize logging
+        self.logger = logging.getLogger('dns_cache')
+
+        # Statistics
+        self._stats = {
+            'hits': 0,
+            'misses': 0,
+            'errors': 0,
+            'last_error': None,
+            'last_error_time': None
+        }
+
+    def _cache_key(self, domain: str, record_type: str) -> str:
+        """
+        Generate cache key from domain and record type
+
+        Args:
+            domain: Domain name
+            record_type: DNS record type
+
+        Returns:
+            str: Cache key
+        """
+        return f"{domain.lower()}:{record_type.upper()}"
+
+    def lookup(self, domain: str, record_type: str = 'MX') -> Optional[Dict[str, Any]]:
+        """
+        Perform a cached DNS lookup with retry logic
+
+        Args:
+            domain: Domain name to lookup
+            record_type: DNS record type
+
+        Returns:
+            Dict containing lookup results or None if lookup fails
+        """
+        cache_key = self._cache_key(domain, record_type)
+
+        # Try to get from cache first
+        with self._lock:
+            if cache_key in self._cache:
+                self._stats['hits'] += 1
+                return self._cache[cache_key]
+            self._stats['misses'] += 1
+
+        # Not in cache, perform lookup with retries
+        for attempt in range(DNS_CONFIG['RETRY_COUNT']):
+            try:
+                start_time = time.time()
+                records = self.resolver.resolve(domain, record_type)
+                lookup_time = time.time() - start_time
+
+                # Format results based on record type
+                if record_type == 'MX':
+                    result = {
+                        'records': [
+                            {
+                                'exchange': str(r.exchange).rstrip('.'),
+                                'preference': r.preference
+                            } for r in records
+                        ],
+                        'lookup_time': lookup_time,
+                        'timestamp': time.time()
+                    }
+                elif record_type == 'TXT':
+                    result = {
+                        'records': [r.strings[0].decode() for r in records],
+                        'lookup_time': lookup_time,
+                        'timestamp': time.time()
+                    }
+                else:
+                    result = {
+                        'records': [str(r) for r in records],
+                        'lookup_time': lookup_time,
+                        'timestamp': time.time()
+                    }
+
+                # Cache the successful result
+                with self._lock:
+                    self._cache[cache_key] = result
+                return result
+
+            except dns.resolver.NXDOMAIN:
+                self._update_error_stats('NXDOMAIN', domain)
+                result = {
+                    'error': 'NXDOMAIN',
+                    'lookup_time': time.time() - start_time
+                }
+                with self._lock:
+                    self._cache[cache_key] = result
+                return result
+
+            except dns.resolver.NoAnswer:
+                self._update_error_stats('NoAnswer', domain)
+                result = {
+                    'error': 'NoAnswer',
+                    'lookup_time': time.time() - start_time
+                }
+                with self._lock:
+                    self._cache[cache_key] = result
+                return result
+
+            except dns.resolver.Timeout:
+                self._update_error_stats('Timeout', domain)
+                if attempt < DNS_CONFIG['RETRY_COUNT'] - 1:
+                    time.sleep(DNS_CONFIG['RETRY_TIMEOUT'])
+                    continue
+                result = {
+                    'error': 'Timeout',
+                    'lookup_time': time.time() - start_time
+                }
+                return result
+
+            except Exception as e:
+                self._update_error_stats(str(e), domain)
+                if attempt < DNS_CONFIG['RETRY_COUNT'] - 1:
+                    time.sleep(DNS_CONFIG['RETRY_TIMEOUT'])
+                    continue
+                result = {
+                    'error': str(e),
+                    'lookup_time': time.time() - start_time
+                }
+                return result
+
+        return None
+
+    def _update_error_stats(self, error: str, domain: str) -> None:
+        """Update error statistics"""
+        with self._lock:
+            self._stats['errors'] += 1
+            self._stats['last_error'] = f"{error} ({domain})"
+            self._stats['last_error_time'] = time.time()
+        self.logger.error(f"DNS lookup error for {domain}: {error}")
+
+    def clear(self) -> None:
+        """Clear the cache"""
+        with self._lock:
+            self._cache.clear()
+            self.logger.info("DNS cache cleared")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Get cache statistics and health metrics
+        
+        Returns:
+            Dict containing cache statistics and health information
+        """
+        with self._lock:
+            stats = {
+                # Cache stats
+                'size': len(self._cache),
+                'maxsize': self._cache.maxsize,
+                'ttl': self._cache.ttl,
+                'currsize': len(self._cache),
+                
+                # Hit/miss stats
+                'hits': self._stats['hits'],
+                'misses': self._stats['misses'],
+                'hit_ratio': (self._stats['hits'] / (self._stats['hits'] + self._stats['misses']) 
+                             if (self._stats['hits'] + self._stats['misses']) > 0 else 0),
+                
+                # Error stats
+                'errors': self._stats['errors'],
+                'last_error': self._stats['last_error'],
+                'last_error_time': self._stats['last_error_time'],
+                
+                # Health metrics
+                'nameservers': self.resolver.nameservers,
+                'timeout': self.resolver.timeout,
+                'lifetime': self.resolver.lifetime
+            }
+            return stats
+
+    def bulk_lookup(self, domains: List[str], record_type: str = 'MX') -> Dict[str, Any]:
+        """
+        Perform bulk DNS lookups efficiently
+        
+        Args:
+            domains: List of domain names to lookup
+            record_type: DNS record type
+            
+        Returns:
+            Dict containing results for each domain
+        """
+        results = {}
+        for domain in domains:
+            results[domain] = self.lookup(domain, record_type)
+        return results
+
+    def prefetch(self, domain: str, record_types: List[str] = ['MX', 'TXT', 'A']) -> None:
+        """
+        Prefetch DNS records for a domain
+        
+        Args:
+            domain: Domain name to prefetch
+            record_types: List of record types to prefetch
+        """
+        for record_type in record_types:
+            self.lookup(domain, record_type)
+
+    def is_valid_domain(self, domain: str) -> bool:
+        """
+        Check if a domain exists and has valid DNS records
+        
+        Args:
+            domain: Domain name to check
+            
+        Returns:
+            bool: Whether domain is valid
+        """
+        result = self.lookup(domain, 'A')
+        if not result or 'error' in result:
+            return False
+        return True
+
+    def get_mx_servers(self, domain: str) -> List[Dict[str, Union[str, int]]]:
+        """
+        Get sorted list of MX servers for a domain
+        
+        Args:
+            domain: Domain name to lookup
+            
+        Returns:
+            List of dicts containing MX server information
+        """
+        result = self.lookup(domain, 'MX')
+        if not result or 'error' in result:
+            return []
+            
+        mx_records = result.get('records', [])
+        return sorted(mx_records, key=lambda x: x['preference'])
+
+# Global DNS cache instance
+dns_cache = DNSCache()
+
+def cached_dns_lookup(func):
+    """
+    Decorator to add DNS caching to methods that perform DNS lookups
+    """
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        # Use the instance's dns_cache
+        if not hasattr(self, 'dns_cache'):
+            self.dns_cache = DNSCache()
+        return func(self, *args, **kwargs)
+    return wrapper
+----------------------------------------
+
+File: email_verifier.py
+
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Any, Tuple
+import dns.resolver
+import socket
+import smtplib
+import time
+import re
+import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from email_validator import validate_email, EmailNotValidError
+from dns_cache import cached_dns_lookup, dns_cache, DNSCache
+from smtp_pool import verify_email_with_pool, smtp_pool
+from error_handler import (
+    handle_dns_error, handle_smtp_error, log_error,
+    DNSError, SMTPError, ValidationError
+)
+import traceback
+import random
+from config import (
+    DNS_CONFIG,
+    SMTP_CONFIG,
+    ROLE_ACCOUNTS,
+    DISPOSABLE_DOMAINS,
+    FREE_EMAIL_PROVIDERS,
+    BLACKLISTS,
+    VALIDATION_RULES,
+    ERROR_MESSAGES
+)
+
+@dataclass
+class DNSSecurityChecks:
+    has_spf: bool
+    has_dmarc: bool
+    has_dkim: bool
+    spf_record: str
+    dmarc_record: str
+    dkim_record: str
+    spf_valid: bool
+    dmarc_valid: bool
+    dkim_valid: bool
+    mx_records: List[str]
+    mx_valid: bool
+
+@dataclass
+class SecurityChecks:
+    blacklisted: bool
+    blacklist_records: List[str]
+    spam_score: int
+    abuse_score: int
+    domain_reputation: str
+
+@dataclass
+class MailServerChecks:
+    has_valid_mx: bool
+    mx_records: List[str]
+    mx_record_details: List[Dict]
+    response_time: float
+    accepts_all: bool
+    has_catch_all: bool
+    port_open: bool
+    smtp_provider: str
+
+@dataclass
+class VerificationScore:
+    score: int
+    verdict: str
+    details: List[str]
+    confidence: str
+    verification_time: float
+
+@dataclass
+class EmailVerificationResult:
+    is_valid: bool
+    format_valid: bool
+    syntax_checks: Dict[str, bool]
+    mx_check: MailServerChecks
+    smtp_check: bool
+    is_disposable: bool
+    is_role_account: bool
+    is_free_email: bool
+    dns_security: DNSSecurityChecks
+    security_checks: SecurityChecks
+    suggestions: List[str]
+    score: VerificationScore
+    error_message: Optional[str] = None
+    catch_all_details: Optional[Dict[str, Any]] = None
+
+class EmailVerifier:
+    """Production-ready email verification with comprehensive checks"""
+
+    def __init__(self):
+        """Initialize verifier with configuration and caching"""
+        self.logger = logging.getLogger('email_verifier')
+
+        # Initialize DNS components
+        self.dns_cache = DNSCache()
+        self.resolver = dns.resolver.Resolver()
+        self.resolver.nameservers = DNS_CONFIG['NAMESERVERS']
+        self.resolver.timeout = DNS_CONFIG['TIMEOUT']
+        self.resolver.lifetime = DNS_CONFIG['LIFETIME']
+
+        # Initialize SMTP components
+        self.timeout = SMTP_CONFIG['TIMEOUT']
+        self.retry_count = SMTP_CONFIG['RETRY_COUNT']
+        self.retry_delay = SMTP_CONFIG['RETRY_DELAY']
+
+        # Load configurations
+        self.role_accounts = ROLE_ACCOUNTS
+        self.disposable_domains = DISPOSABLE_DOMAINS
+        self.free_providers = FREE_EMAIL_PROVIDERS
+        self.blacklists = BLACKLISTS
+
+        # Initialize spam trap patterns
+        self._init_spam_trap_patterns()
+
+        self.logger.info("EmailVerifier initialized with production configuration")
+
+    def _init_spam_trap_patterns(self):
+        """Initialize spam trap detection patterns"""
+        self.spam_trap_patterns = {
+            'prefixes': [
+                # Common trap indicators
+                'spam', 'trap', 'honey', 'spamtrap', 'filter', 'block',
+                'abuse', 'report', 'blackhole', 'honeypot', 'spampot',
+
+                # Testing/Validation
+                'test', 'validate', 'verify', 'check', 'probe',
+                'scan', 'audit', 'monitor', 'dummy', 'sample',
+
+                # System accounts
+                'system', 'daemon', 'robot', 'auto', 'noreply',
+                'no-reply', 'donotreply', 'bounce', 'mailer'
+            ],
+            'patterns': [
+                # Basic trap patterns
+                r'^spam\.', r'^trap\.', r'^honey\.', r'^filter\.',
+                r'^block\.', r'^catch\.', r'^bounce\.',
+
+                # Development patterns
+                r'^dev(el)?\d*\.', r'^test\d*\.', r'^admin\d*\.',
+                r'^staging\.', r'^uat\.', r'^qa\.',
+
+                # Random/Hash patterns
+                r'[0-9a-f]{8,}',           # Hex strings
+                r'\d{10,}',                # Long numbers
+                r'^[a-z0-9]{20,}@',        # Long random strings
+                r'[a-f0-9]{32}',           # MD5-like
+                r'[a-f0-9]{40}',           # SHA1-like
+
+                # Suspicious combinations
+                r'^(spam|trap|honey).*\d{4,}',
+                r'^(test|dev).*[0-9a-f]{6,}',
+                r'(spam|trap|honey).*\.(test|dev)',
+
+                # Time-based patterns
+                r'\d{8,}.*@',              # Date-like numbers
+                r'\d{4}-\d{2}-\d{2}',      # ISO date format
+
+                # Special formatting
+                r'.*\.{2,}.*@',            # Multiple dots
+                r'.*_{2,}.*@',             # Multiple underscores
+                r'.*-{2,}.*@'              # Multiple hyphens
+            ]
+        }
+
+    def verify_email(self, email: str) -> EmailVerificationResult:
+        """
+        Perform comprehensive email verification with production safeguards
+
+        Args:
+            email: Email address to verify
+
+        Returns:
+            EmailVerificationResult containing detailed verification results
+        """
+        start_time = time.time()
+        suggestions = []
+
+        try:
+            # Basic format validation
+            try:
+                if not self._validate_format(email):
+                    raise ValidationError(
+                        'INVALID_FORMAT',
+                        ERROR_MESSAGES['INVALID_EMAIL'],
+                        'Email format validation failed'
+                    )
+            except ValidationError as e:
+                log_error(e.error, self.logger)
+                return self._create_error_result(str(e))
+
+            local_part, domain = email.lower().split('@')
+
+            # Enhanced MX check with detailed information
+            try:
+                mx_data = self._enhanced_mx_check(domain)
+                mx_check = self._parse_mx_records(mx_data)
+
+                if not mx_check.has_valid_mx:
+                    raise DNSError(
+                        'NO_MX_RECORDS',
+                        ERROR_MESSAGES['NO_MX_RECORDS'],
+                        f"Domain: {domain}"
+                    )
+            except Exception as e:
+                error = handle_dns_error(e)
+                log_error(error, self.logger)
+                return self._create_error_result(error.message)
+
+            # Enhanced validation checks
+            is_role = self._is_role_account(local_part)
+            is_disposable = domain in self.disposable_domains
+            is_spam_trap = self._is_spam_trap(local_part, domain)
+            is_free_email = domain in self.free_providers
+
+            # Advanced catch-all detection - BEFORE SMTP check
+            try:
+                is_catch_all, catch_all_details = self._check_catch_all(domain, mx_check.mx_records)
+                mx_check.has_catch_all = is_catch_all
+                mx_check.accepts_all = is_catch_all
+
+                if is_catch_all and catch_all_details:
+                    self.logger.warning(
+                        f"Catch-all detected for {domain} "
+                        f"(Confidence: {catch_all_details['confidence']:.2f}, "
+                        f"Method: {catch_all_details['detection_method']})"
+                    )
+                    suggestions.append(f"Domain accepts all emails ({catch_all_details['server_behavior']})")
+            except Exception as e:
+                self.logger.error(f"Catch-all detection error for {domain}: {str(e)}")
+                is_catch_all = False
+                catch_all_details = None
+                mx_check.has_catch_all = False
+                mx_check.accepts_all = False
+
+            # SMTP verification with connection pooling
+            try:
+                smtp_check = self._verify_smtp_with_role_check(email, mx_check.mx_records, is_role)
+            except Exception as e:
+                error = handle_smtp_error(e)
+                log_error(error, self.logger)
+                smtp_check = False
+
+            # Security checks with caching
+            try:
+                dns_security = self._check_dns_security(domain)
+                security_checks = self._check_security(domain)
+            except Exception as e:
+                error = handle_dns_error(e)
+                log_error(error, self.logger)
+                dns_security = DNSSecurityChecks(
+                    has_spf=False, spf_record="", spf_valid=False,
+                    has_dmarc=False, dmarc_record="", dmarc_valid=False,
+                    has_dkim=False, dkim_record="", dkim_valid=False,
+                    mx_records=[], mx_valid=False
+                )
+                security_checks = SecurityChecks(
+                    blacklisted=False,
+                    blacklist_records=[],
+                    spam_score=0,
+                    abuse_score=0,
+                    domain_reputation="Unknown"
+                )
+
+            # Calculate initial score
+            score = self._calculate_score(
+                mx_check=mx_check,
+                dns_security=dns_security,
+                security_checks=security_checks,
+                smtp_valid=smtp_check,
+                is_role=is_role,
+                is_disposable=is_disposable,
+                is_spam_trap=is_spam_trap,
+                verification_time=time.time() - start_time
+            )
+
+            # Adjust score for catch-all status
+            if is_catch_all:
+                score = self._adjust_score_for_catch_all(score, is_catch_all)
+
+            # Add remaining suggestions
+            suggestions.extend(self._generate_suggestions(
+                smtp_check, is_role, is_spam_trap,
+                security_checks, dns_security, mx_check
+            ))
+
+            return EmailVerificationResult(
+                is_valid=smtp_check and not is_spam_trap,
+                format_valid=True,
+                syntax_checks=self._get_syntax_checks(email),
+                mx_check=mx_check,
+                smtp_check=smtp_check,
+                is_disposable=is_disposable,
+                is_role_account=is_role,
+                is_free_email=is_free_email,
+                dns_security=dns_security,
+                security_checks=security_checks,
+                suggestions=suggestions,
+                score=score,
+                catch_all_details=catch_all_details
+            )
+
+        except Exception as e:
+            self.logger.error(f"Unexpected error verifying {email}: {str(e)}", exc_info=True)
+            return self._create_error_result(f"Verification error: {str(e)}")
+
+
+    def _validate_format(self, email: str) -> bool:
+        """
+        Validate email format using strict rules
+
+        Args:
+            email: Email address to validate
+
+        Returns:
+            bool: Whether format is valid
+        """
+        try:
+            validate_email(email)
+            local_part, domain = email.split('@')
+
+            # Additional validation rules from config
+            if len(local_part) > VALIDATION_RULES['MAX_LOCAL_PART_LENGTH']:
+                return False
+            if len(email) > VALIDATION_RULES['MAX_EMAIL_LENGTH']:
+                return False
+
+            return True
+        except EmailNotValidError:
+            return False
+
+    def _enhanced_mx_check(self, domain: str) -> Dict:
+        """
+        Perform enhanced MX record validation with connection testing
+
+        Args:
+            domain: Domain to check
+
+        Returns:
+            Dict containing MX validation results
+        """
+        try:
+            mx_records = self.resolver.resolve(domain, 'MX')
+            mx_info = []
+
+            # Test each MX record
+            for record in mx_records:
+                mx_host = str(record.exchange).rstrip('.')
+                priority = record.preference
+                try:
+                    # Get IP and test port
+                    ip = socket.gethostbyname(mx_host)
+                    port_open = self._check_port_open(ip)
+
+                    # Additional server info
+                    server_info = {
+                        'host': mx_host,
+                        'priority': priority,
+                        'ip': ip,
+                        'port_open': port_open,
+                        'response_time': self._measure_response_time(mx_host)
+                    }
+                    mx_info.append(server_info)
+                except Exception as e:
+                    self.logger.warning(f"Error checking MX record {mx_host}: {str(e)}")
+                    mx_info.append({
+                        'host': mx_host,
+                        'priority': priority,
+                        'ip': None,
+                        'port_open': False,
+                        'response_time': None
+                    })
+
+            return {
+                'has_mx': True,
+                'records': sorted(mx_info, key=lambda x: x['priority']),
+                'error': None
+            }
+        except Exception as e:
+            self.logger.error(f"MX check error for {domain}: {str(e)}")
+            return {
+                'has_mx': False,
+                'records': [],
+                'error': str(e)
+            }
+
+    def _parse_mx_records(self, mx_data: Dict) -> MailServerChecks:
+        """
+        Parse MX record data into structured format
+
+        Args:
+            mx_data: Raw MX record data
+
+        Returns:
+            MailServerChecks containing parsed MX information
+        """
+        if not mx_data['has_mx']:
+            return MailServerChecks(
+                has_valid_mx=False,
+                mx_records=[],
+                mx_record_details=[],
+                response_time=0.0,
+                accepts_all=False,
+                has_catch_all=False,
+                port_open=False,
+                smtp_provider="unknown"
+            )
+
+        # Extract basic record info
+        records = [r['host'] for r in mx_data['records']]
+        port_open = any(r['port_open'] for r in mx_data['records'])
+
+        # Get average response time
+        response_times = [r['response_time'] for r in mx_data['records'] 
+                        if r['response_time'] is not None]
+        avg_response = sum(response_times) / len(response_times) if response_times else 0.0
+
+        # Detect provider
+        provider = self._detect_smtp_provider(records)
+
+        return MailServerChecks(
+            has_valid_mx=True,
+            mx_records=records,
+            mx_record_details=mx_data['records'],
+            response_time=avg_response,
+            accepts_all=False,  # Will be set by catch-all check
+            has_catch_all=False,  # Will be set by catch-all check
+            port_open=port_open,
+            smtp_provider=provider
+        )
+
+    def _measure_response_time(self, host: str) -> Optional[float]:
+        """
+        Measure SMTP server response time
+
+        Args:
+            host: SMTP host to test
+
+        Returns:
+            float: Response time in seconds, or None if failed
+        """
+        try:
+            start_time = time.time()
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(self.timeout)
+                s.connect((host, 25))
+                return time.time() - start_time
+        except:
+            return None
+
+    def _check_port_open(self, host: str) -> bool:
+        """
+        Check if SMTP port is open
+
+        Args:
+            host: Host to check
+
+        Returns:
+            bool: Whether port 25 is open
+        """
+        for attempt in range(self.retry_count):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(self.timeout / self.retry_count)
+                    s.connect((host, 25))
+                    return True
+            except:
+                if attempt < self.retry_count - 1:
+                    time.sleep(self.retry_delay)
+                continue
+        return False
+
+    def _detect_smtp_provider(self, mx_records: List[str]) -> str:
+        """
+        Detect email service provider from MX records
+
+        Args:
+            mx_records: List of MX record hostnames
+
+        Returns:
+            str: Detected provider name or "unknown"
+        """
+        provider_patterns = {
+            'google': ['google', 'gmail', 'googlemail'],
+            'microsoft': ['outlook', 'hotmail', 'microsoft'],
+            'amazon': ['amazonses', 'aws-smtp'],
+            'proton': ['protonmail', 'proton.ch'],
+            'yahoo': ['yahoo', 'yahoodns'],
+            'zoho': ['zoho', 'zohomail'],
+            'mailgun': ['mailgun', 'mg'],
+            'sendgrid': ['sendgrid', 'smtp.sendgrid'],
+            'office365': ['protection.outlook.com'],
+            'ovh': ['ovh.net'],
+            'ionos': ['ionos'],
+            'godaddy': ['secureserver.net']
+        }
+
+        # Check each provider's patterns
+        for provider, patterns in provider_patterns.items():
+            if any(pattern in mx.lower() for mx in mx_records 
+                  for pattern in patterns):
+                return provider
+
+        return "unknown"
+
+    @cached_dns_lookup
+    def _check_dns_security(self, domain: str) -> DNSSecurityChecks:
+        """
+        Check domain DNS security configuration
+
+        Args:
+            domain: Domain to check
+
+        Returns:
+            DNSSecurityChecks containing security validation results
+        """
+        try:
+            # Get all security records
+            spf = self._check_spf(domain)
+            dmarc = self._check_dmarc(domain)
+            dkim = self._check_dkim(domain)
+            mx = self._check_mx(domain)
+
+            return DNSSecurityChecks(
+                has_spf=spf['exists'],
+                has_dmarc=dmarc['exists'],
+                has_dkim=dkim['exists'],
+                spf_record=spf['record'],
+                dmarc_record=dmarc['record'],
+                dkim_record=dkim['record'],
+                spf_valid=spf['valid'],
+                dmarc_valid=dmarc['valid'],
+                dkim_valid=dkim['valid'],
+                mx_records=mx['records'],
+                mx_valid=mx['valid']
+            )
+        except Exception as e:
+            self.logger.error(f"DNS security check error: {str(e)}", exc_info=True)
+            return DNSSecurityChecks(
+                has_spf=False, spf_record="", spf_valid=False,
+                has_dmarc=False, dmarc_record="", dmarc_valid=False,
+                has_dkim=False, dkim_record="", dkim_valid=False,
+                mx_records=[], mx_valid=False
+            )
+
+    @cached_dns_lookup
+    def _check_mx(self, domain: str) -> Dict[str, Any]:
+        """Check domain MX records"""
+        try:
+            lookup_result = self.dns_cache.lookup(domain, 'MX')
+
+            if 'error' in lookup_result:
+                return {'valid': False, 'records': []}
+
+            records = []
+            for record in lookup_result['records']:
+                records.append({
+                    'exchange': record['exchange'],
+                    'preference': record['preference']
+                })
+
+            sorted_records = sorted(records, key=lambda x: x['preference'])
+            return {
+                'valid': True,
+                'records': [f"{r['exchange']} (Priority: {r['preference']})" for r in sorted_records]
+            }
+        except Exception:
+            return {'valid': False, 'records': []}
+
+    def _check_security(self, domain: str) -> SecurityChecks:
+        """Check domain security status"""
+        blacklisted = False
+        blacklist_records = []
+
+        for bl in self.blacklists:
+            try:
+                test_domain = f"{domain}.{bl}"
+                result = self.dns_cache.lookup(test_domain, 'A')
+                if 'error' not in result:
+                    blacklisted = True
+                    blacklist_records.append(bl)
+            except:
+                continue
+
+        abuse_score = 50 if blacklisted else 0
+        reputation = "Poor" if blacklisted else "Good"
+
+        return SecurityChecks(
+            blacklisted=blacklisted,
+            blacklist_records=blacklist_records,
+            spam_score=50 if blacklisted else 0,
+            abuse_score=abuse_score,
+            domain_reputation=reputation
+        )
+
+    @cached_dns_lookup
+    def _check_spf(self, domain: str) -> Dict[str, Any]:
+        """
+        Check domain SPF records with validation
+
+        Args:
+            domain: Domain to check
+
+        Returns:
+            Dict containing SPF check results
+        """
+        result = self.dns_cache.lookup(domain, 'TXT')
+        if 'error' in result:
+            return {'exists': False, 'record': '', 'valid': False}
+
+        for record in result['records']:
+            if record.startswith('v=spf1'):
+                # Validate SPF syntax
+                valid = self._validate_spf(record)
+                return {
+                    'exists': True,
+                    'record': record,
+                    'valid': valid
+                }
+
+        return {'exists': False, 'record': '', 'valid': False}
+
+    def _validate_spf(self, record: str) -> bool:
+        """
+        Validate SPF record syntax
+
+        Args:
+            record: SPF record to validate
+
+        Returns:
+            bool: Whether syntax is valid
+        """
+        try:
+            # Basic SPF syntax validation
+            parts = record.split()
+            if parts[0] != 'v=spf1':
+                return False
+
+            valid_mechanisms = {'all', 'include', 'a', 'mx', 'ip4', 'ip6', 
+                              'exists', 'redirect', 'exp', 'ptr'}
+            valid_qualifiers = {'+', '-', '~', '?'}
+
+            for part in parts[1:]:
+                # Check qualifiers
+                if part[0] in valid_qualifiers:
+                    part = part[1:]
+
+                # Check mechanisms
+                mechanism = part.split(':', 1)[0]
+                if mechanism not in valid_mechanisms:
+                    return False
+
+            return True
+        except:
+            return False
+
+    @cached_dns_lookup
+    def _check_dmarc(self, domain: str) -> Dict[str, Any]:
+        """
+        Check domain DMARC records with policy validation
+
+        Args:
+            domain: Domain to check
+
+        Returns:
+            Dict containing DMARC check results
+        """
+        try:
+            dmarc_domain = f'_dmarc.{domain}'
+            result = self.dns_cache.lookup(dmarc_domain, 'TXT')
+
+            if 'error' in result:
+                return {'exists': False, 'record': '', 'valid': False}
+
+            for record in result['records']:
+                if record.startswith('v=DMARC1'):
+                    # Validate DMARC policy
+                    policy = re.search(r'p=(\w+)', record)
+                    valid = bool(policy and policy.group(1) in ['reject', 'quarantine', 'none'])
+                    return {
+                        'exists': True,
+                        'record': record,
+                        'valid': valid,
+                        'policy': policy.group(1) if policy else 'none'
+                    }
+
+            return {'exists': False, 'record': '', 'valid': False, 'policy': None}
+        except Exception as e:
+            self.logger.error(f"DMARC check error: {str(e)}", exc_info=True)
+            return {'exists': False, 'record': '', 'valid': False, 'policy': None}
+
+    @cached_dns_lookup
+    def _check_dkim(self, domain: str) -> Dict[str, Any]:
+        """
+        Check domain DKIM records with comprehensive selector testing
+
+        Args:
+            domain: Domain to check
+
+        Returns:
+            Dict containing DKIM check results
+        """
+        selectors = ['default', 'google', 'k1', 'mail', 'dkim', 
+                    'selector1', 'selector2', 'key1', 'key2']
+
+        for selector in selectors:
+            try:
+                dkim_domain = f'{selector}._domainkey.{domain}'
+                result = self.dns_cache.lookup(dkim_domain, 'TXT')
+
+                if 'error' not in result:
+                    for record in result['records']:
+                        if 'v=DKIM1' in record:
+                            # Validate DKIM record
+                            valid = self._validate_dkim(record)
+                            return {
+                                'exists': True,
+                                'record': record,
+                                'valid': valid,
+                                'selector': selector
+                            }
+            except Exception as e:
+                self.logger.debug(f"DKIM check failed for selector {selector}: {str(e)}")
+                continue
+
+        return {'exists': False, 'record': '', 'valid': False, 'selector': None}
+
+    def _validate_dkim(self, record: str) -> bool:
+        """
+        Validate DKIM record syntax
+
+        Args:
+            record: DKIM record to validate
+
+        Returns:
+            bool: Whether syntax is valid
+        """
+        try:
+            # Required DKIM tags
+            required_tags = ['v', 'k', 'p']
+
+            # Parse tags
+            tags = {}
+            parts = record.split(';')
+            for part in parts:
+                part = part.strip()
+                if '=' in part:
+                    key, value = part.split('=', 1)
+                    tags[key.strip()] = value.strip()
+
+            # Check required tags
+            for tag in required_tags:
+                if tag not in tags:
+                    return False
+
+            # Validate version
+            if tags['v'] != 'DKIM1':
+                return False
+
+            # Validate key type
+            if tags['k'] not in ['rsa', 'ed25519']:
+                return False
+
+            # Validate public key presence
+            if not tags['p']:
+                return False
+
+            return True
+        except:
+            return False
+
+    def _check_catch_all(self, domain: str, mx_records: List[str]) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """Advanced catch-all detection with multiple testing strategies"""
+        self.logger.info(f"Starting catch-all detection for {domain}")
+        start_time = time.time()  # Added this line
+
+        try:
+            # Test patterns
+            patterns = [
+                f"nonexistent_{int(time.time())}_{random.randint(1000, 9999)}@{domain}",
+                f"test.{time.time()}@{domain}",
+                f"verify.{random.randint(1000, 9999)}@{domain}",
+                f"thisisnotarealuser_{random.randint(100000, 999999)}@{domain}",
+                f"catchalltest_{time.time()}@{domain}"
+            ]
+
+            results = []
+            for pattern in patterns:
+                self.logger.debug(f"Testing catch-all pattern: {pattern}")
+                for attempt in range(self.retry_count):
+                    try:
+                        is_valid = self._verify_smtp_with_role_check(pattern, mx_records, False)
+                        results.append(is_valid)
+                        break
+                    except Exception as e:
+                        if attempt < self.retry_count - 1:
+                            time.sleep(self.retry_delay)
+                            continue
+                        self.logger.warning(f"Catch-all test failed for {pattern}: {str(e)}")
+                        results.append(False)
+                        break
+
+            valid_count = sum(1 for r in results if r)
+            is_catch_all = valid_count >= 2
+
+            if is_catch_all:
+                confidence = min(0.95, 0.5 + (valid_count / len(patterns)) * 0.45)
+                detection_method = 'multiple_pattern_test'
+                server_behavior = 'accepts_all_standard_patterns'
+            else:
+                confidence = 0.9
+                detection_method = 'standard_test'
+                server_behavior = 'normal_validation'
+
+            catch_all_details = {
+                'is_catch_all': is_catch_all,
+                'detection_method': detection_method,
+                'confidence': confidence,
+                'server_behavior': server_behavior,
+                'response_patterns': {
+                    'test_patterns': patterns,
+                    'results': results,
+                    'valid_count': valid_count
+                },
+                'verification_time': time.time() - start_time
+            }
+
+            self.logger.info(
+                f"Catch-all detection completed for {domain}: "
+                f"{'Detected' if is_catch_all else 'Not detected'} "
+                f"(Confidence: {confidence:.2f})"
+            )
+
+            return is_catch_all, catch_all_details
+
+        except Exception as e:
+            self.logger.error(f"Catch-all detection error: {str(e)}", exc_info=True)
+            return False, None
+
+    def _verify_smtp_with_role_check(self, email: str, mx_records: List[str], is_role: bool) -> bool:
+        """Verify email via SMTP with role account handling"""
+        if not mx_records:
+            return False
+
+        for mx in mx_records[:2]:  # Try first two MX records
+            try:
+                with smtplib.SMTP(timeout=self.timeout) as smtp:
+                    # Test connection
+                    conn = smtp.connect(str(mx), 25)
+
+                    # EHLO/HELO check
+                    try:
+                        ehlo_response = smtp.ehlo()
+                        if ehlo_response[0] != 250:
+                            smtp.helo()
+                    except Exception as e:
+                        self.logger.debug(f"EHLO failed for {mx}: {str(e)}")
+                        continue
+
+                    # Email verification
+                    try:
+                        smtp.mail('')
+                        code, message = smtp.rcpt(email)
+
+                        if code == 250:
+                            return True
+                        elif code == 550:
+                            continue  # Try next MX
+                        elif code in [421, 450, 451, 452]:
+                            # Temporary failures
+                            return True if is_role else False
+
+                    except smtplib.SMTPServerDisconnected:
+                        if is_role:
+                            return True  # Accept disconnection for role accounts
+                        continue
+
+                    except smtplib.SMTPResponseException as e:
+                        if is_role and e.smtp_code in [521, 421, 450, 451, 452]:
+                            return True
+                        continue
+
+            except Exception as e:
+                self.logger.warning(f"SMTP verification failed for {mx}: {str(e)}")
+                continue
+
+        return False
+
+    def _calculate_score(self, **kwargs) -> VerificationScore:
+        """
+        Calculate comprehensive email verification score
+
+        Args:
+            **kwargs: Score calculation parameters
+
+        Returns:
+            VerificationScore containing detailed score information
+        """
+        score = 100
+        details = []
+
+        # Core verification check
+        if not kwargs['smtp_valid']:
+            if kwargs['is_role']:
+                score -= 30
+                details.append("Role account with restricted access")
+            else:
+                score = 0
+                details.append("Email does not exist")
+                return VerificationScore(
+                    score=score,
+                    verdict="Failed",
+                    details=details,
+                    confidence="Very High",
+                    verification_time=kwargs['verification_time']
+                )
+
+        # MX checks
+        mx = kwargs['mx_check']
+        if not mx.has_valid_mx:
+            score -= 50
+            details.append("No valid MX records")
+        if not mx.port_open:
+            score -= 10
+            details.append("SMTP ports not accessible")
+        if mx.has_catch_all:
+            score -= 25
+            details.append("Catch-all domain detected")
+
+        # Security checks
+        if kwargs['is_spam_trap']:
+            score -= 100
+            details.append("Spam trap detected")
+        if kwargs['is_disposable']:
+            score -= 40
+            details.append("Disposable email detected")
+        if kwargs['security_checks'].blacklisted:
+            score -= 50
+            details.append("Domain is blacklisted")
+
+        # DNS security
+        dns_sec = kwargs['dns_security']
+        if not dns_sec.has_spf:
+            score -= 10
+            details.append("Missing SPF record")
+        if not dns_sec.has_dmarc:
+            score -= 15
+            details.append("Missing DMARC record")
+        if not dns_sec.has_dkim:
+            score -= 15
+            details.append("Missing DKIM setup")
+
+        score = max(0, min(100, score))
+
+        # Determine verdict
+        verdict = self._get_verdict_with_catch_all(score) if mx.has_catch_all else (
+            "Excellent" if score >= 90 else
+            "Good" if score >= 70 else
+            "Fair" if score >= 50 else
+            "Poor" if score >= 30 else "Failed"
+        )
+
+        # Determine confidence
+        confidence = (
+            "Very High" if score >= 90 or score == 0 else
+            "High" if score >= 70 else
+            "Medium" if score >= 50 else "Low"
+        )
+
+        if mx.has_catch_all:
+            confidence = "Medium" if confidence in ["Very High", "High"] else confidence
+
+        return VerificationScore(
+            score=score,
+            verdict=verdict,
+            details=details,
+            confidence=confidence,
+            verification_time=kwargs['verification_time']
+        )
+
+    def _adjust_score_for_catch_all(self, score: VerificationScore, is_catch_all: bool) -> VerificationScore:
+        """
+        Adjust verification score for catch-all domains
+
+        Args:
+            score: Original verification score
+            is_catch_all: Whether domain is catch-all
+
+        Returns:
+            VerificationScore: Adjusted score
+        """
+        if is_catch_all:
+            new_score = max(0, score.score - 25)
+            new_details = score.details + ["Score reduced: Catch-all domain detected"]
+
+            return VerificationScore(
+                score=new_score,
+                verdict=self._get_verdict_with_catch_all(new_score),
+                details=new_details,
+                confidence="Medium" if score.confidence == "High" else score.confidence,
+                verification_time=score.verification_time
+            )
+        return score
+
+    def _get_verdict_with_catch_all(self, score: int) -> str:
+        """
+        Get verdict text for catch-all domains
+
+        Args:
+            score: Verification score
+
+        Returns:
+            str: Verdict text
+        """
+        if score >= 85:
+            return "Excellent (But Catch-all)"
+        elif score >= 70:
+            return "Good (But Catch-all)"
+        elif score >= 50:
+            return "Fair (But Catch-all)"
+        else:
+            return "Poor"
+
+    def _is_role_account(self, local_part: str) -> bool:
+        """
+        Check if email is a role account
+
+        Args:
+            local_part: Local part of email address
+
+        Returns:
+            bool: Whether it's a role account
+        """
+        return local_part.lower() in self.role_accounts
+
+    def _is_spam_trap(self, local_part: str, domain: str) -> bool:
+        """
+        Check if email matches spam trap patterns
+
+        Args:
+            local_part: Local part of email
+            domain: Domain part of email
+
+        Returns:
+            bool: Whether email matches spam trap patterns
+        """
+        local_part = local_part.lower()
+        domain = domain.lower()
+
+        # Check prefixes
+        if any(local_part.startswith(prefix) 
+               for prefix in self.spam_trap_patterns['prefixes']):
+            return True
+
+        # Check regex patterns
+        if any(re.match(pattern, local_part) 
+               for pattern in self.spam_trap_patterns['patterns']):
+            return True
+
+        # Check for suspicious combinations
+        if re.match(r'^[0-9a-f]{8,}$', local_part):  # Hash-like
+            return True
+        if re.match(r'^\d{10,}$', local_part):  # Long numbers
+            return True
+        if len(local_part) > 40:  # Excessively long
+            return True
+
+        return False
+
+    def _get_syntax_checks(self, email: str) -> Dict[str, bool]:
+        """
+        Perform detailed syntax validation
+
+        Args:
+            email: Email address to validate
+
+        Returns:
+            Dict: Detailed syntax check results
+        """
+        try:
+            local_part, domain = email.split('@')
+
+            return {
+                'local_length': len(local_part) <= VALIDATION_RULES['MAX_LOCAL_PART_LENGTH'],
+                'total_length': len(email) <= VALIDATION_RULES['MAX_EMAIL_LENGTH'],
+                'valid_local_chars': bool(re.match(
+                    r'^[a-zA-Z0-9.!#$%&\'*+/=?^_`{|}~-]+$', 
+                    local_part
+                )),
+                'valid_domain': bool(re.match(
+                    r'^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$',
+                    domain
+                )),
+                'no_consecutive_dots': '..' not in local_part,
+                'no_leading_dots': not local_part.startswith('.'),
+                'no_trailing_dots': not local_part.endswith('.'),
+                'valid_domain_length': len(domain) <= VALIDATION_RULES['MAX_DOMAIN_LENGTH'],
+                'valid_label_length': all(
+                    len(label) <= 63 for label in domain.split('.')
+                ),
+                'valid_special_chars': all(
+                    char in VALIDATION_RULES['ALLOWED_SPECIAL_CHARS'] 
+                    for char in local_part 
+                    if not char.isalnum()
+                )
+            }
+        except Exception as e:
+            self.logger.error(f"Syntax check error: {str(e)}", exc_info=True)
+            return {
+                'local_length': False,
+                'total_length': False,
+                'valid_local_chars': False,
+                'valid_domain': False,
+                'no_consecutive_dots': False,
+                'no_leading_dots': False,
+                'no_trailing_dots': False,
+                'valid_domain_length': False,
+                'valid_label_length': False,
+                'valid_special_chars': False
+            }
+
+    def _generate_suggestions(self, smtp_check: bool, is_role: bool, 
+                            is_spam_trap: bool, security_checks: SecurityChecks,
+                            dns_security: DNSSecurityChecks,
+                            mx_check: MailServerChecks) -> List[str]:
+        """
+        Generate helpful suggestions based on verification results
+
+        Args:
+            smtp_check: SMTP verification result
+            is_role: Whether email is role account
+            is_spam_trap: Whether email matches spam trap patterns
+            security_checks: Security check results
+            dns_security: DNS security check results
+            mx_check: MX check results
+
+        Returns:
+            List[str]: List of suggestions
+        """
+        suggestions = []
+
+        # Core validation suggestions
+        if not smtp_check:
+            if is_role:
+                suggestions.append("Role account with restricted SMTP verification")
+            else:
+                suggestions.append("Email address does not exist or is not accepting emails")
+
+        # Account type suggestions
+        if is_role:
+            suggestions.append("This appears to be a role account rather than a personal email")
+        if is_spam_trap:
+            suggestions.append("This email matches patterns commonly used for spam traps")
+
+        # Security suggestions
+        if security_checks.blacklisted:
+            suggestions.append(
+                f"Domain is blacklisted in {len(security_checks.blacklist_records)} "
+                "reputation systems"
+            )
+        if not dns_security.has_dmarc:
+            suggestions.append("Domain lacks DMARC protection - susceptible to spoofing")
+        if not dns_security.has_spf and not dns_security.has_dkim:
+            suggestions.append("Domain lacks both SPF and DKIM - vulnerable to email forgery")
+        elif not dns_security.has_spf:
+            suggestions.append("Domain lacks SPF protection")
+        elif not dns_security.has_dkim:
+            suggestions.append("Domain lacks DKIM protection")
+
+        # MX suggestions
+        if mx_check.has_catch_all:
+            suggestions.append("Domain accepts all email addresses - specific validation not possible")
+        if not mx_check.port_open:
+            suggestions.append("SMTP ports are not accessible - may affect email delivery")
+
+        return suggestions
+
+    def _create_error_result(self, error_message: str) -> EmailVerificationResult:
+        """
+        Create standardized error result
+
+        Args:
+            error_message: Error message to include
+
+        Returns:
+            EmailVerificationResult: Error result
+        """
+        return EmailVerificationResult(
+            is_valid=False,
+            format_valid=False,
+            syntax_checks={},
+            mx_check=MailServerChecks(
+                has_valid_mx=False,
+                mx_records=[],
+                mx_record_details=[],
+                response_time=0.0,
+                accepts_all=False,
+                has_catch_all=False,
+                port_open=False,
+                smtp_provider="unknown"
+            ),
+            smtp_check=False,
+            is_disposable=False,
+            is_role_account=False,
+            is_free_email=False,
+            dns_security=DNSSecurityChecks(
+                has_spf=False, spf_record="", spf_valid=False,
+                has_dmarc=False, dmarc_record="", dmarc_valid=False,
+                has_dkim=False, dkim_record="", dkim_valid=False,
+                mx_records=[], mx_valid=False
+            ),
+            security_checks=SecurityChecks(
+                blacklisted=False,
+                blacklist_records=[],
+                spam_score=0,
+                abuse_score=0,
+                domain_reputation="Unknown"
+            ),
+            suggestions=[error_message],
+            score=VerificationScore(
+                score=0,
+                verdict="Error",
+                details=[error_message],
+                confidence="Very Low",
+                verification_time=0.0
+            ),
+            error_message=error_message
+        )
+----------------------------------------
+
+File: error_handler.py
+
+from typing import Optional, Dict, Any
+import logging
+from dataclasses import dataclass
+from datetime import datetime
+import traceback
+import dns.resolver
+import smtplib
+import socket
+
+@dataclass
+class VerificationError:
+    """Structured error information for email verification"""
+    error_code: str
+    message: str
+    detail: str
+    timestamp: datetime
+    retry_possible: bool
+    error_type: str
+    suggestion: str
+
+class EmailVerificationError(Exception):
+    """Base exception class for email verification errors"""
+    def __init__(self, error_code: str, message: str, detail: str = "", retry_possible: bool = True):
+        self.error = VerificationError(
+            error_code=error_code,
+            message=message,
+            detail=detail,
+            timestamp=datetime.now(),
+            retry_possible=retry_possible,
+            error_type=self.__class__.__name__,
+            suggestion=self._get_suggestion(error_code)
+        )
+        super().__init__(message)
+
+    def _get_suggestion(self, error_code: str) -> str:
+        suggestions = {
+            'DNS_LOOKUP_ERROR': 'Check domain DNS configuration or try again later',
+            'SMTP_CONNECTION_ERROR': 'Mail server might be temporarily unavailable',
+            'SMTP_TIMEOUT': 'Try again later or verify server connectivity',
+            'INVALID_EMAIL': 'Please check the email format',
+            'SERVER_REJECT': 'Verify email address exists',
+            'RATE_LIMIT': 'Reduce verification frequency or wait before retrying',
+            'BLOCKED': 'IP might be blocked, try later or use different IP',
+            'MAILBOX_FULL': 'Target mailbox is full',
+            'ROLE_ACCOUNT': 'Role account detected, verification might be restricted',
+            'CATCH_ALL': 'Domain accepts all emails, specific verification not possible'
+        }
+        return suggestions.get(error_code, 'Please try again or contact support')
+
+class DNSError(EmailVerificationError):
+    """DNS related errors"""
+    pass
+
+class SMTPError(EmailVerificationError):
+    """SMTP related errors"""
+    pass
+
+class ValidationError(EmailVerificationError):
+    """Input validation errors"""
+    pass
+
+def handle_dns_error(e: Exception) -> VerificationError:
+    """Handle DNS resolution errors"""
+    if isinstance(e, dns.resolver.NXDOMAIN):
+        return VerificationError(
+            error_code='DNS_LOOKUP_ERROR',
+            message='Domain does not exist',
+            detail=str(e),
+            timestamp=datetime.now(),
+            retry_possible=False,
+            error_type='DNSError',
+            suggestion='Verify domain name is correct'
+        )
+    elif isinstance(e, dns.resolver.NoAnswer):
+        return VerificationError(
+            error_code='DNS_LOOKUP_ERROR',
+            message='No MX records found',
+            detail=str(e),
+            timestamp=datetime.now(),
+            retry_possible=False,
+            error_type='DNSError',
+            suggestion='Domain is not configured for email'
+        )
+    elif isinstance(e, dns.resolver.Timeout):
+        return VerificationError(
+            error_code='DNS_TIMEOUT',
+            message='DNS lookup timeout',
+            detail=str(e),
+            timestamp=datetime.now(),
+            retry_possible=True,
+            error_type='DNSError',
+            suggestion='Try again later'
+        )
+    else:
+        return VerificationError(
+            error_code='DNS_ERROR',
+            message='DNS error occurred',
+            detail=str(e),
+            timestamp=datetime.now(),
+            retry_possible=True,
+            error_type='DNSError',
+            suggestion='Check DNS configuration'
+        )
+
+def handle_smtp_error(e: Exception) -> VerificationError:
+    """Handle SMTP connection and verification errors"""
+    if isinstance(e, smtplib.SMTPServerDisconnected):
+        return VerificationError(
+            error_code='SMTP_CONNECTION_ERROR',
+            message='Server disconnected',
+            detail=str(e),
+            timestamp=datetime.now(),
+            retry_possible=True,
+            error_type='SMTPError',
+            suggestion='Server might be protecting against verification'
+        )
+    elif isinstance(e, smtplib.SMTPResponseException):
+        error_info = {
+            550: ('SERVER_REJECT', 'Mailbox does not exist', False),
+            551: ('SERVER_REJECT', 'User not local', False),
+            552: ('MAILBOX_FULL', 'Mailbox full', True),
+            450: ('RATE_LIMIT', 'Too many requests', True),
+            421: ('RATE_LIMIT', 'Service not available', True),
+        }
+        code_info = error_info.get(e.smtp_code, ('SMTP_ERROR', str(e.smtp_error), True))
+        return VerificationError(
+            error_code=code_info[0],
+            message=code_info[1],
+            detail=f"SMTP Code: {e.smtp_code}, Message: {e.smtp_error}",
+            timestamp=datetime.now(),
+            retry_possible=code_info[2],
+            error_type='SMTPError',
+            suggestion=code_info[1]
+        )
+    elif isinstance(e, socket.timeout):
+        return VerificationError(
+            error_code='SMTP_TIMEOUT',
+            message='Connection timeout',
+            detail=str(e),
+            timestamp=datetime.now(),
+            retry_possible=True,
+            error_type='SMTPError',
+            suggestion='Server might be slow or blocking verification'
+        )
+    else:
+        return VerificationError(
+            error_code='SMTP_ERROR',
+            message='SMTP error occurred',
+            detail=str(e),
+            timestamp=datetime.now(),
+            retry_possible=True,
+            error_type='SMTPError',
+            suggestion='Try again later'
+        )
+
+def log_error(error: VerificationError, logger: Optional[logging.Logger] = None) -> None:
+    """Log error with appropriate severity"""
+    if logger is None:
+        logger = logging.getLogger('email_verifier')
+
+    log_message = (
+        f"Error: {error.error_code}\n"
+        f"Message: {error.message}\n"
+        f"Detail: {error.detail}\n"
+        f"Timestamp: {error.timestamp}\n"
+        f"Type: {error.error_type}\n"
+        f"Retry Possible: {error.retry_possible}\n"
+        f"Suggestion: {error.suggestion}"
+    )
+
+    if error.retry_possible:
+        logger.warning(log_message)
+    else:
+        logger.error(log_message)
+
+def format_error_response(error: VerificationError) -> Dict[str, Any]:
+    """Format error for API response"""
+    return {
+        'error': {
+            'code': error.error_code,
+            'message': error.message,
+            'type': error.error_type,
+            'retry_possible': error.retry_possible,
+            'suggestion': error.suggestion,
+            'timestamp': error.timestamp.isoformat()
+        }
+    }
+----------------------------------------
+
+File: models.py
+
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+
+@dataclass
+class DNSSecurityChecks:
+    has_spf: bool
+    has_dmarc: bool
+    has_dkim: bool
+    spf_record: str
+    dmarc_record: str
+    dkim_record: str
+    spf_valid: bool
+    dmarc_valid: bool
+    dkim_valid: bool
+
+@dataclass
+class SecurityChecks:
+    blacklisted: bool
+    blacklist_records: List[str]
+    spam_score: int
+    abuse_score: int
+    domain_reputation: str
+
+@dataclass
+class MailServerChecks:
+    has_valid_mx: bool
+    mx_records: List[str]
+    response_time: float
+    accepts_all: bool
+    has_catch_all: bool
+    port_open: bool
+    smtp_provider: str
+
+@dataclass
+class VerificationScore:
+    score: int
+    verdict: str
+    details: List[str]
+    confidence: str
+    verification_time: float
+
+@dataclass
+class EmailVerificationResult:
+    is_valid: bool
+    format_valid: bool
+    syntax_checks: Dict[str, bool]
+    mx_check: MailServerChecks
+    smtp_check: bool
+    is_disposable: bool
+    is_role_account: bool
+    is_free_email: bool
+    dns_security: DNSSecurityChecks
+    security_checks: SecurityChecks
+    suggestions: List[str]
+    score: VerificationScore
+    error_message: Optional[str] = None
+----------------------------------------
+
+File: pyproject.toml
+
+[project]
+name = "python-template"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+requires-python = ">=3.11"
+dependencies = [
+    "cachetools>=5.5.0",
+    "dnspython>=2.7.0",
+    "email-validator>=2.2.0",
+    "flask>=3.1.0",
+    "idna>=3.10",
+    "whois>=1.20240129.2",
+]
+
+----------------------------------------
+
+File: quick_email_verifier.py
+
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any
+import dns.resolver
+import re
+import socket
+import smtplib
+import time
+import logging
+import traceback  # Added this import
+from dns_cache import cached_dns_lookup, DNSCache
+from smtp_pool import verify_email_with_pool, smtp_pool
+from error_handler import (
+    handle_dns_error, handle_smtp_error, log_error,
+    DNSError, SMTPError, ValidationError
+)
+from catch_all_detector import (
+    AdvancedCatchAllDetector,
+    CatchAllResult
+)
+
+@dataclass
+class QuickVerificationResult:
+    is_valid: bool
+    format_valid: bool
+    domain_valid: bool
+    mailbox_exists: bool
+    is_role_account: bool
+    is_disposable: bool
+    is_catch_all: bool
+    is_free_email: bool
+    is_honeypot: bool
+    has_valid_syntax: bool
+    has_parked_mx: bool
+    has_valid_smtp: bool
+    verification_time: float
+    status: str
+    details: List[str]
+    suggestions: List[str]
+    mx_records: Optional[List[str]] = None
+    catch_all_details: Optional[Dict[str, Any]] = None  # Added this field
+
+class QuickEmailVerifier:
+    def __init__(self):
+        # Initialize logger
+        self.logger = logging.getLogger('quick_email_verifier')
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        ))
+        self.logger.addHandler(handler)
+        self.logger.setLevel(logging.INFO)
+
+        # Initialize timeout
+        self.timeout = 5
+
+        # Initialize role accounts
+        self.role_accounts = {
+            # Common business roles
+            "admin",
+            "info",
+            "support",
+            "sales",
+            "contact",
+            "help",
+            "billing",
+            "marketing",
+            "webmaster",
+            "postmaster",
+            "hostmaster",
+            "abuse",
+            "noreply",
+            "no-reply",
+            "team",
+            "hello",
+            "office",
+
+            # Additional business roles
+            "accounts",
+            "accounting",
+            "administrator",
+            "advertise",
+            "advertising",
+            "alerts",
+            "api",
+            "app",
+            "appointments",
+            "business",
+            "careers",
+            "customer",
+            "customercare",
+            "customersupport",
+            "data",
+            "developer",
+            "developers",
+            "development",
+            "enquiries",
+            "enquiry",
+            "feedback",
+            "finance",
+            "general",
+            "groups",
+            "hr",
+            "humanresources",
+            "inquiries",
+            "inquiry",
+            "invest",
+            "investment",
+            "investors",
+            "it",
+            "jobs",
+            "legal",
+            "mail",
+            "mailer",
+            "media",
+            "news",
+            "newsletter",
+            "notifications",
+            "orders",
+            "partners",
+            "partnership",
+            "payments",
+            "payroll",
+            "pr",
+            "press",
+            "privacy",
+            "procurement",
+            "product",
+            "projects",
+            "recruiting",
+            "recruitment",
+            "register",
+            "registry",
+            "research",
+            "resources",
+            "root",
+            "security",
+            "service",
+            "services",
+            "social",
+            "staff",
+            "sysadmin",
+            "system",
+            "systems",
+            "tech",
+            "technical",
+            "test",
+            "testing",
+            "training",
+            "engineering",
+            "welfare",
+            "welcome"
+        }
+
+        # Initialize disposable domains
+        self.disposable_domains = {
+            # Common temporary email services
+            "tempmail.com",
+            "10minutemail.com",
+            "throwawaymail.com",
+            "mailinator.com",
+            "guerrillamail.com",
+            "yopmail.com",
+            "temp-mail.org",
+            "trashmail.com",
+            "sharklasers.com",
+            "getairmail.com",
+            "mint.lgbt",
+            "maildrop.cc",
+
+            # Additional disposable services
+            "tempmail.net",
+            "temp-mail.io",
+            "temporarily.de",
+            "disposablemail.com",
+            "wegwerfemail.de",
+            "throwawaymail.net",
+            "minutemail.com",
+            "tempmailaddress.com",
+            "tempmailer.com",
+            "fakeinbox.com",
+            "mailnesia.com",
+            "tempr.email",
+            "dispostable.com",
+            "spamgourmet.com",
+            "emailondeck.com",
+            "tempinbox.com",
+            "mohmal.com",
+            "crazymailing.com",
+            "temp-mail.ru",
+            "hulapla.de",
+            "mailcatch.com",
+            "tempmail.ninja",
+            "burnermail.io",
+            "33mail.com",
+            "hide.biz.st",
+            "mytemp.email",
+            "temp-mail.net",
+            "mailforspam.com",
+            "mailspeed.ru",
+            "deadfake.com",
+            "mailnull.com",
+            "emailfake.com",
+            "tempmails.net",
+            "trash-mail.com",
+            "guerrillamailblock.com",
+            "sharklasers.com",
+            "grr.la",
+            "spam4.me",
+            "burnthis.email",
+            "nada.email",
+            "owlymail.com",
+            "jetable.org",
+            "tempsky.com",
+            "generator.email"
+        }
+
+        # Initialize free email providers
+        self.free_email_providers = {
+            # Major providers
+            "gmail.com",
+            "yahoo.com",
+            "hotmail.com",
+            "outlook.com",
+            "aol.com",
+            "protonmail.com",
+            "icloud.com",
+
+            # Other popular providers
+            "zoho.com",
+            "mail.com",
+            "yandex.com",
+            "gmx.com",
+            "live.com",
+
+            # Additional providers
+            "yahoo.co.uk",
+            "yahoo.co.in",
+            "yahoo.co.jp",
+            "googlemail.com",
+            "tutanota.com",
+            "fastmail.com",
+            "me.com",
+            "msn.com",
+            "yahoo.fr",
+            "yahoo.de",
+            "mail.ru",
+            "inbox.com",
+            "rocketmail.com",
+            "qq.com",
+            "163.com",
+            "126.com",
+            "rediffmail.com",
+            "proton.me",
+            "pm.me",
+            "att.net",
+            "comcast.net",
+            "verizon.net",
+            "web.de",
+            "free.fr",
+            "libero.it",
+            "t-online.de"
+        }
+
+        # Initialize honeypot patterns
+        self.honeypot_patterns = [
+            # Original patterns
+            r'^spam\.', r'^trap\.', r'^honey\.', 
+            r'^no-reply\.', r'^noreply\.', 
+            r'^postmaster\.', r'^admin\.', r'^administrator\.',
+            r'^hostmaster\.', r'^webmaster\.', 
+            r'^abuse\.', r'^security\.', 
+            r'^info\.', r'^remove\.',
+            r'^subscribe\.', r'^unsubscribe\.', 
+            r'^newsletter\.', r'^marketing\.',
+            r'^test\.', r'^mail\.',
+
+            # Additional role accounts
+            r'^support\.', r'^help\.',
+            r'^billing\.', r'^account\.',
+            r'^sales\.', r'^contact\.',
+
+            # Common variants and obfuscation patterns
+            r'^sp[a@]m\.', r'^tr[a@]p\.',
+            r'^h[o0]ney\.', r'^n[o0]-?reply\.',
+            r'^[a@]dm[i1]n\.', r'^[a@]bus[e3]\.',
+
+            # Temporary or testing patterns
+            r'^temp\.', r'^dummy\.',
+            r'^fake\.', r'^test-?[0-9]*\.',
+            r'^sample\.', r'^example\.',
+
+            # Additional security-related patterns
+            r'^blackhole\.', r'^devnull\.',
+            r'^suspicious\.', r'^blocked\.',
+            r'^report\.', r'^complaint\.',
+
+            # Common honeypot keywords
+            r'^decoy\.', r'^bait\.',
+            r'^poison\.', r'^catch\.',
+            r'^spider\.', r'^crawler\.'
+        ]
+
+        # Log successful initialization
+        self.logger.info("QuickEmailVerifier initialized successfully")
+
+    # Rest of the methods remain the same as in the previous version
+    from error_handler import (
+        handle_dns_error, handle_smtp_error, log_error,
+        DNSError, SMTPError, ValidationError
+    )
+
+    def verify_email(self, email: str) -> QuickVerificationResult:
+        try:
+            start_time = time.time()
+            details = []
+            suggestions = []
+
+            # Enhanced format and syntax validation with error handling
+            try:
+                syntax_valid = self._validate_syntax(email)
+                format_valid = syntax_valid['is_valid']
+
+                if not format_valid:
+                    raise ValidationError(
+                        'INVALID_FORMAT',
+                        'Invalid email format',
+                        detail=str(syntax_valid['details'])
+                    )
+            except ValidationError as e:
+                log_error(e.error, self.logger)
+                return self._create_error_result(
+                    [e.error.message],
+                    [e.error.suggestion],
+                    time.time() - start_time
+                )
+
+            try:
+                local_part, domain = email.lower().split('@')
+            except ValueError:
+                error = ValidationError(
+                    'INVALID_EMAIL',
+                    'Invalid email format',
+                    'Email must contain exactly one @ symbol'
+                )
+                log_error(error.error, self.logger)
+                return self._create_error_result(
+                    [error.error.message],
+                    [error.error.suggestion],
+                    time.time() - start_time
+                )
+
+            # Domain and MX validation with error handling
+            try:
+                domain_check = self._validate_domain_enhanced(domain)
+            except Exception as e:
+                error = handle_dns_error(e)
+                log_error(error, self.logger)
+                return self._create_error_result(
+                    [error.message],
+                    [error.suggestion],
+                    time.time() - start_time
+                )
+
+            if not domain_check['is_valid']:
+                details.extend(domain_check['details'])
+                suggestions.extend(domain_check['suggestions'])
+                return self._create_error_result(details, suggestions, time.time() - start_time)
+
+            # SMTP verification with error handling
+            try:
+                smtp_check = self._verify_smtp_enhanced(email, domain_check['mx_records'])
+            except Exception as e:
+                error = handle_smtp_error(e)
+                log_error(error, self.logger)
+                if error.error_code in ['RATE_LIMIT', 'SMTP_TIMEOUT']:
+                    # For temporary errors, return a special result
+                    return QuickVerificationResult(
+                        is_valid=False,
+                        format_valid=True,
+                        domain_valid=True,
+                        mailbox_exists=None,  # Unknown due to temporary error
+                        is_role_account=email.split('@')[0] in self.role_accounts,
+                        is_disposable=domain in self.disposable_domains,
+                        is_catch_all=False,
+                        is_free_email=domain in self.free_email_providers,
+                        is_honeypot=self._check_honeypot(local_part, domain),
+                        has_valid_syntax=True,
+                        has_parked_mx=domain_check['is_parked'],
+                        has_valid_smtp=None,  # Unknown due to temporary error
+                        verification_time=time.time() - start_time,
+                        status="Temporary Failure - Retry Later",
+                        details=[error.message],
+                        suggestions=[error.suggestion],
+                        catch_all_details=None  # No catch-all info for temporary errors
+                    )
+
+                return self._create_error_result(
+                    [error.message],
+                    [error.suggestion],
+                    time.time() - start_time
+                )
+
+            if not smtp_check['is_valid']:
+                details.extend(smtp_check['details'])
+                suggestions.extend(smtp_check['suggestions'])
+
+            # Advanced catch-all detection
+            try:
+                detector = AdvancedCatchAllDetector()
+                detector_result = detector.detect_catch_all(
+                    domain, 
+                    domain_check['mx_records'],
+                    self._verify_smtp_enhanced
+                )
+                is_catch_all = detector_result.is_catch_all
+
+                # Add catch-all details to suggestions if detected
+                if is_catch_all:
+                    details.append(f"Catch-all domain detected (Confidence: {detector_result.confidence:.2f})")
+                    suggestions.append(f"Domain accepts all emails ({detector_result.server_behavior})")
+            except Exception as e:
+                self.logger.error(f"Catch-all detection error: {str(e)}")
+                detector_result = None
+                is_catch_all = False
+
+            # Additional checks
+            is_role = local_part.lower() in self.role_accounts
+            is_disposable = domain.lower() in self.disposable_domains
+            is_free_email = domain.lower() in self.free_email_providers
+            is_honeypot = self._check_honeypot(local_part, domain)
+            has_parked_mx = domain_check['is_parked']
+
+            # Prepare catch-all details
+            catch_all_details = None
+            if detector_result:
+                catch_all_details = {
+                    'is_catch_all': is_catch_all,
+                    'detection_method': detector_result.detection_method,
+                    'confidence': detector_result.confidence,
+                    'server_behavior': detector_result.server_behavior
+                }
+
+            return QuickVerificationResult(
+                is_valid=smtp_check['is_valid'] and not is_honeypot and not has_parked_mx,
+                format_valid=True,
+                domain_valid=domain_check['is_valid'],
+                mailbox_exists=smtp_check['is_valid'],
+                is_role_account=is_role,
+                is_disposable=is_disposable,
+                is_catch_all=is_catch_all,
+                is_free_email=is_free_email,
+                is_honeypot=is_honeypot,
+                has_valid_syntax=True,
+                has_parked_mx=has_parked_mx,
+                has_valid_smtp=smtp_check['is_valid'],
+                verification_time=time.time() - start_time,
+                status=self._determine_status(
+                    smtp_check['is_valid'],
+                    is_disposable,
+                    is_catch_all,
+                    is_honeypot,
+                    has_parked_mx
+                ),
+                details=details,
+                suggestions=suggestions,
+                catch_all_details=catch_all_details,  # Added catch-all details
+                mx_records=domain_check.get('mx_records', [])
+            )
+
+        except Exception as e:
+            self.logger.error(f"Unexpected error: {str(e)}\n{traceback.format_exc()}")
+            return self._create_error_result(
+                ["An unexpected error occurred"],
+                ["Please try again later or contact support"],
+                time.time() - start_time
+            )
+
+    def _validate_syntax(self, email: str) -> dict:
+        """Enhanced syntax validation with detailed feedback"""
+        result = {'is_valid': True, 'details': [], 'suggestions': []}
+
+        # Length checks
+        if len(email) > 254:
+            result['is_valid'] = False
+            result['details'].append("Email exceeds maximum length of 254 characters")
+            result['suggestions'].append("Shorten the email address")
+
+        try:
+            local_part, domain = email.split('@')
+        except ValueError:
+            result['is_valid'] = False
+            result['details'].append("Invalid email format")
+            result['suggestions'].append("Email must contain exactly one @ symbol")
+            return result
+
+        # Local part checks
+        if len(local_part) > 64:
+            result['is_valid'] = False
+            result['details'].append("Local part exceeds maximum length of 64 characters")
+            result['suggestions'].append("Shorten the local part of the email")
+
+        if local_part.startswith('.') or local_part.endswith('.'):
+            result['is_valid'] = False
+            result['details'].append("Local part cannot start or end with a dot")
+            result['suggestions'].append("Remove leading/trailing dots from local part")
+
+        if '..' in local_part:
+            result['is_valid'] = False
+            result['details'].append("Local part contains consecutive dots")
+            result['suggestions'].append("Remove consecutive dots from local part")
+
+        # Domain checks
+        if not re.match(r'^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', domain):
+            result['is_valid'] = False
+            result['details'].append("Invalid domain format")
+            result['suggestions'].append("Check domain format and TLD")
+
+        return result
+        
+
+    @cached_dns_lookup
+    def _validate_domain_enhanced(self, domain: str) -> dict:
+        """Enhanced domain validation with parked MX detection using DNS cache"""
+        result = {
+            'is_valid': False,
+            'is_parked': False,
+            'mx_records': [],
+            'details': [],
+            'suggestions': []
+        }
+
+        lookup_result = self.dns_cache.lookup(domain, 'MX')
+
+        if 'error' in lookup_result:
+            if lookup_result['error'] == 'NXDOMAIN':
+                result['details'].append("Domain does not exist")
+                result['suggestions'].append("Check if the domain name is correct")
+            elif lookup_result['error'] == 'NoAnswer':
+                result['details'].append("Domain exists but has no MX records")
+                result['suggestions'].append("Domain is not configured for email")
+            else:
+                result['details'].append(f"DNS lookup error: {lookup_result['error']}")
+                result['suggestions'].append("Unable to verify domain. Please try again later")
+            return result
+
+        # Process MX records
+        mx_list = [record['exchange'].lower() for record in lookup_result['records']]
+        result['mx_records'] = mx_list
+
+        # Check for parked MX records
+        parked_patterns = [
+            'parkingcrew.net',
+            'sedoparking.com',
+            'domainparking.com',
+            'pending-setup.com',
+            'hostinger.com'
+        ]
+
+        if any(pattern in mx for mx in mx_list for pattern in parked_patterns):
+            result['is_parked'] = True
+            result['details'].append("Domain has parked mail exchangers")
+            result['suggestions'].append("This domain's email service is not properly configured")
+        else:
+            result['is_valid'] = True
+
+        return result
+
+    def _verify_smtp_enhanced(self, email: str, mx_records: List[str]) -> dict:
+        """Enhanced SMTP verification using connection pool"""
+        result = {
+            'is_valid': False,
+            'details': [],
+            'suggestions': [],
+            'mx_info': {
+                'has_mx': bool(mx_records),
+                'records': mx_records,
+                'ports_open': [],
+                'response_codes': []
+            }
+        }
+
+        if not mx_records:
+            result['details'].append("No MX records found")
+            result['suggestions'].append("Verify domain DNS configuration")
+            return result
+
+        # Use connection pool for verification
+        is_valid, message = verify_email_with_pool(email, mx_records)
+        result['is_valid'] = is_valid
+
+        if is_valid:
+            if "temporarily" in message:
+                result['details'].append(f"Server responded with temporary error")
+                result['suggestions'].append("The mail server is experiencing temporary issues")
+            else:
+                result['details'].append("Email address verified")
+        else:
+            result['details'].append(message)
+            result['suggestions'].append("Check if the email address is correct")
+
+        # For role accounts, treat certain responses as valid
+        if not is_valid and email.split('@')[0] in self.role_accounts:
+            result['is_valid'] = True
+            result['details'].append("Common role account with valid mail servers")
+            result['suggestions'].append("Role accounts often have restricted SMTP verification")
+
+        return result
+
+    def _check_honeypot(self, local_part: str, domain: str) -> bool:
+        """Check if email matches known spam trap patterns"""
+        # Check local part against patterns
+        if any(re.match(pattern, local_part) for pattern in self.honeypot_patterns):
+            return True
+
+        # Check for suspicious number patterns
+        if re.match(r'.*(\d{8,}|[a-f0-9]{8,}).*', local_part):
+            return True
+
+        # Check for random-looking strings
+        if re.match(r'^[a-z0-9]{12,}$', local_part):
+            return True
+
+        return False
+
+    def _determine_status(self, smtp_valid: bool, is_disposable: bool, 
+                         is_catch_all: bool, is_honeypot: bool, is_parked: bool) -> str:
+        """Determine the final status based on all checks"""
+        if is_honeypot:
+            return "Invalid - Potential Spam Trap"
+        if is_parked:
+            return "Invalid - Parked Domain"
+        if not smtp_valid:
+            return "Invalid - Do Not Send"
+        if is_disposable:
+            return "Valid - But Disposable"
+        if is_catch_all:
+            return "Valid - But Catch-all (Use Caution)"
+        return "Valid - OK to Send"
+
+    def _create_error_result(self, details: List[str], suggestions: List[str], 
+                           verification_time: float) -> QuickVerificationResult:
+        """Create an error result with all fields populated"""
+        return QuickVerificationResult(
+            is_valid=False,
+            format_valid=False,
+            domain_valid=False,
+            mailbox_exists=False,
+            is_role_account=False,
+            is_disposable=False,
+            is_catch_all=False,
+            is_free_email=False,
+            is_honeypot=False,
+            has_valid_syntax=False,
+            has_parked_mx=False,
+            has_valid_smtp=False,
+            verification_time=verification_time,
+            status="Invalid - Error",
+            details=details,
+            suggestions=suggestions
+        )
+
+    def _check_catch_all(self, domain: str, mx_records: List[str]) -> bool:
+        """Enhanced catch-all detection using advanced detector"""
+        detector = AdvancedCatchAllDetector()
+        result = detector.detect_catch_all(
+            domain, 
+            mx_records,
+            self._verify_smtp_enhanced
+        )
+
+        # Log detailed results for analysis
+        self.logger.info(
+            f"Catch-all detection for {domain}:\n"
+            f"Result: {result.is_catch_all}\n"
+            f"Confidence: {result.confidence}\n"
+            f"Method: {result.detection_method}\n"
+            f"Behavior: {result.server_behavior}\n"
+            f"Time: {result.verification_time:.2f}s"
+        )
+
+        return result.is_catch_all
+----------------------------------------
+
+File: rate_limiter.py
+
+from typing import Dict, Optional, Tuple
+import time
+from collections import defaultdict
+from threading import Lock
+import logging
+from dataclasses import dataclass
+from config import RATE_LIMITS
+
+@dataclass
+class RateLimit:
+    """Rate limit configuration"""
+    requests: int
+    window: int
+
+@dataclass
+class RateLimitState:
+    """Current state of rate limiting"""
+    count: int
+    window_start: float
+
+class RateLimiter:
+    """Thread-safe rate limiter with support for multiple limit types"""
+
+    def __init__(self):
+        # Initialize logger
+        self.logger = logging.getLogger('rate_limiter')
+
+        # Initialize rate limits from config
+        self.default_limits = {
+            'global': RateLimit(**RATE_LIMITS['GLOBAL']),
+            'domain': RateLimit(**RATE_LIMITS['DOMAIN']),
+            'ip': RateLimit(**RATE_LIMITS['IP']),
+            'domain_ip': RateLimit(**RATE_LIMITS['DOMAIN_IP'])
+        }
+
+        # Rate limit states
+        self._global_state = RateLimitState(0, time.time())
+        self._domain_states: Dict[str, RateLimitState] = defaultdict(
+            lambda: RateLimitState(0, time.time())
+        )
+        self._ip_states: Dict[str, RateLimitState] = defaultdict(
+            lambda: RateLimitState(0, time.time())
+        )
+        self._domain_ip_states: Dict[str, RateLimitState] = defaultdict(
+            lambda: RateLimitState(0, time.time())
+        )
+
+        # Thread safety
+        self._lock = Lock()
+
+        self.logger.info("Rate limiter initialized with configuration: %s", RATE_LIMITS)
+
+    def _check_limit(self, state: RateLimitState, limit: RateLimit, now: float) -> Tuple[bool, float]:
+        """
+        Check if request is within rate limit
+
+        Args:
+            state: Current state of the rate limit
+            limit: Rate limit configuration
+            now: Current timestamp
+
+        Returns:
+            Tuple containing:
+            - bool: Whether request is allowed
+            - float: Seconds until rate limit resets
+        """
+        # Reset counter if window has expired
+        if now - state.window_start >= limit.window:
+            state.count = 0
+            state.window_start = now
+
+        # Check if limit is exceeded
+        if state.count >= limit.requests:
+            retry_after = state.window_start + limit.window - now
+            return False, max(0, retry_after)
+
+        return True, 0
+
+    def check_rate_limit(self, domain: str, ip: str) -> Tuple[bool, str, float]:
+        """
+        Check if request is allowed under rate limits
+
+        Args:
+            domain: Domain being validated
+            ip: IP address making request
+
+        Returns:
+            Tuple containing:
+            - bool: Whether request is allowed
+            - str: Type of limit exceeded (if any)
+            - float: Seconds until rate limit resets
+        """
+        try:
+            with self._lock:
+                now = time.time()
+
+                # Normalize inputs
+                domain = domain.lower().strip()
+                ip = ip.strip()
+
+                # Check global limit
+                allowed, retry_after = self._check_limit(
+                    self._global_state,
+                    self.default_limits['global'],
+                    now
+                )
+                if not allowed:
+                    return False, 'global', retry_after
+
+                # Check domain limit
+                allowed, retry_after = self._check_limit(
+                    self._domain_states[domain],
+                    self.default_limits['domain'],
+                    now
+                )
+                if not allowed:
+                    return False, 'domain', retry_after
+
+                # Check IP limit
+                allowed, retry_after = self._check_limit(
+                    self._ip_states[ip],
+                    self.default_limits['ip'],
+                    now
+                )
+                if not allowed:
+                    return False, 'ip', retry_after
+
+                # Check domain+IP limit
+                domain_ip_key = f"{domain}:{ip}"
+                allowed, retry_after = self._check_limit(
+                    self._domain_ip_states[domain_ip_key],
+                    self.default_limits['domain_ip'],
+                    now
+                )
+                if not allowed:
+                    return False, 'domain_ip', retry_after
+
+                # Increment counters if all checks pass
+                self._global_state.count += 1
+                self._domain_states[domain].count += 1
+                self._ip_states[ip].count += 1
+                self._domain_ip_states[domain_ip_key].count += 1
+
+                return True, '', 0
+
+        except Exception as e:
+            self.logger.error(f"Error checking rate limit: {str(e)}", exc_info=True)
+            # On error, allow the request but log the issue
+            return True, '', 0
+
+    def get_remaining_quota(self, domain: str, ip: str) -> Dict[str, Dict[str, int]]:
+        """
+        Get remaining quota for all limit types
+
+        Args:
+            domain: Domain to check
+            ip: IP address to check
+
+        Returns:
+            Dict containing remaining quota information for each limit type
+        """
+        try:
+            with self._lock:
+                now = time.time()
+                quotas = {}
+
+                # Normalize inputs
+                domain = domain.lower().strip()
+                ip = ip.strip()
+                domain_ip_key = f"{domain}:{ip}"
+
+                # Check each limit type
+                states = {
+                    'global': self._global_state,
+                    'domain': self._domain_states[domain],
+                    'ip': self._ip_states[ip],
+                    'domain_ip': self._domain_ip_states[domain_ip_key]
+                }
+
+                for limit_type, state in states.items():
+                    limit = self.default_limits[limit_type]
+
+                    # Reset if window expired
+                    if now - state.window_start >= limit.window:
+                        remaining = limit.requests
+                        window_remaining = limit.window
+                    else:
+                        remaining = max(0, limit.requests - state.count)
+                        window_remaining = max(0, state.window_start + limit.window - now)
+
+                    quotas[limit_type] = {
+                        'remaining_requests': remaining,
+                        'window_remaining': int(window_remaining),
+                        'limit': limit.requests,
+                        'window': limit.window
+                    }
+
+                return quotas
+
+        except Exception as e:
+            self.logger.error(f"Error getting quota: {str(e)}", exc_info=True)
+            # Return empty quotas on error
+            return {}
+
+    def clear_expired(self) -> None:
+        """Clear expired rate limit states to prevent memory growth"""
+        try:
+            with self._lock:
+                now = time.time()
+
+                # Clear expired domain states
+                for domain in list(self._domain_states.keys()):
+                    state = self._domain_states[domain]
+                    if now - state.window_start >= self.default_limits['domain'].window:
+                        del self._domain_states[domain]
+
+                # Clear expired IP states
+                for ip in list(self._ip_states.keys()):
+                    state = self._ip_states[ip]
+                    if now - state.window_start >= self.default_limits['ip'].window:
+                        del self._ip_states[ip]
+
+                # Clear expired domain+IP states
+                for key in list(self._domain_ip_states.keys()):
+                    state = self._domain_ip_states[key]
+                    if now - state.window_start >= self.default_limits['domain_ip'].window:
+                        del self._domain_ip_states[key]
+
+                self.logger.info("Cleared expired rate limit states")
+
+        except Exception as e:
+            self.logger.error(f"Error clearing expired states: {str(e)}", exc_info=True)
+
+# Create global rate limiter instance
+rate_limiter = RateLimiter()
+----------------------------------------
+
+File: replit.nix
+
+{pkgs}: {
+  deps = [
+    pkgs.inetutils
+    pkgs.cacert
+  ];
+}
+
+----------------------------------------
+
+File: score_calculator.py
+
+from dataclasses import dataclass
+from typing import List, Dict
+from models import MailServerChecks, DNSSecurityChecks, SecurityChecks, VerificationScore
+
+@dataclass
+class ScoreWeights:
+    """Defines the maximum points deductible for each category"""
+    SMTP_VERIFICATION = 100  # Complete failure if email doesn't exist
+    MAIL_SERVER = 35        # Essential infrastructure checks
+    DNS_SECURITY = 30       # Security configuration
+    SECURITY_CHECKS = 25    # Blacklist and spam checks
+    ACCOUNT_TYPE = 20       # Disposable and role account penalties
+    PERFORMANCE = 5         # Response time penalties
+    BONUS = 15             # Bonus for excellent configuration
+
+class EmailScoreCalculator:
+    def __init__(self):
+        self.weights = ScoreWeights()
+
+    def calculate_score(self,
+                       mail_server: MailServerChecks,
+                       dns_security: DNSSecurityChecks,
+                       security: SecurityChecks,
+                       is_disposable: bool,
+                       is_role: bool,
+                       smtp_check: bool,
+                       verification_time: float) -> VerificationScore:
+        """
+        Calculate email verification score with detailed breakdown
+        """
+        score = 100
+        details = []
+        category_scores = {
+            'Infrastructure': 0,
+            'Security': 0,
+            'Risk Factors': 0,
+            'Performance': 0
+        }
+
+        # SMTP Verification (Critical Check)
+        if not smtp_check:
+            score = 0
+            details.append("Email address doesn't exist (-100)")
+            return VerificationScore(
+                score=0,
+                verdict="Failed",
+                details=details,
+                confidence="Very High",
+                verification_time=verification_time
+            )
+
+        # Mail Server Checks
+        server_deductions = 0
+        if not mail_server.has_valid_mx:
+            server_deductions += 10
+            details.append("Missing valid MX records (-10)")
+        if not mail_server.port_open:
+            server_deductions += 5
+            details.append("SMTP port closed (-5)")
+        if mail_server.has_catch_all:
+            server_deductions += 15
+            details.append("Catch-all domain detected (-15)")
+
+        score -= server_deductions
+        category_scores['Infrastructure'] = self.weights.MAIL_SERVER - server_deductions
+
+        # Provider Bonus
+        if mail_server.smtp_provider.lower() in ['google', 'microsoft', 'yahoo', 'protonmail']:
+            score += 10
+            details.append("Reputable email provider (+10)")
+
+        # DNS Security Checks
+        security_deductions = self._calculate_dns_security_deductions(dns_security, details)
+        score -= security_deductions
+        category_scores['Security'] = (self.weights.DNS_SECURITY - security_deductions)
+
+        # Security Risk Checks
+        risk_deductions = self._calculate_security_deductions(security, details)
+        score -= risk_deductions
+        category_scores['Security'] += (self.weights.SECURITY_CHECKS - risk_deductions)
+
+        # Account Type Penalties
+        type_deductions = 0
+        if is_disposable:
+            type_deductions += 15
+            details.append("Disposable email detected (-15)")
+        if is_role:
+            type_deductions += 5
+            details.append("Role account detected (-5)")
+
+        score -= type_deductions
+        category_scores['Risk Factors'] = self.weights.ACCOUNT_TYPE - type_deductions
+
+        # Performance Score
+        perf_deductions = 0
+        if verification_time > 5:
+            perf_deductions = min(5, int((verification_time - 4) / 2))
+            if perf_deductions > 0:
+                details.append(f"Slow response time (-{perf_deductions})")
+
+        score -= perf_deductions
+        category_scores['Performance'] = self.weights.PERFORMANCE - perf_deductions
+
+        # Bonus Points
+        if self._qualifies_for_bonus(dns_security):
+            score += self.weights.BONUS
+            details.append(f"Complete and strong email security configuration (+{self.weights.BONUS})")
+
+        # Ensure score stays within bounds
+        score = max(0, min(100, score))
+
+        verdict = self._get_enhanced_verdict(score, category_scores)
+        confidence = self._get_enhanced_confidence(score, smtp_check, mail_server.has_valid_mx)
+
+        return VerificationScore(
+            score=score,
+            verdict=verdict,
+            details=details,
+            confidence=confidence,
+            verification_time=verification_time
+        )
+
+    def _calculate_dns_security_deductions(self, dns_security: DNSSecurityChecks, details: List[str]) -> int:
+        deductions = 0
+
+        # SPF Checks
+        if not dns_security.has_spf:
+            deductions += 10
+            details.append("Missing SPF record (-10)")
+        elif not dns_security.spf_valid:
+            deductions += 5
+            details.append("Invalid SPF record (-5)")
+
+        # DMARC Checks
+        if not dns_security.has_dmarc:
+            deductions += 10
+            details.append("Missing DMARC record (-10)")
+        else:
+            dmarc_record = dns_security.dmarc_record.lower()
+            if 'p=none' in dmarc_record:
+                deductions += 5
+                details.append("Weak DMARC policy (p=none) (-5)")
+            elif 'p=quarantine' in dmarc_record:
+                deductions += 2
+                details.append("Moderate DMARC policy (p=quarantine) (-2)")
+
+        # DKIM Checks
+        if not dns_security.has_dkim:
+            deductions += 8
+            details.append("Missing DKIM setup (-8)")
+        elif not dns_security.dkim_valid:
+            deductions += 4
+            details.append("Invalid DKIM configuration (-4)")
+
+        return deductions
+
+    def _calculate_security_deductions(self, security: SecurityChecks, details: List[str]) -> int:
+        deductions = 0
+
+        if security.blacklisted:
+            deductions += 20
+            details.append("Domain blacklisted (-20)")
+        if security.spam_score >= 50:
+            deductions += 5
+            details.append("High spam score (-5)")
+
+        return deductions
+
+    def _qualifies_for_bonus(self, dns_security: DNSSecurityChecks) -> bool:
+        return (dns_security.has_spf and dns_security.spf_valid and 
+                dns_security.has_dmarc and 'p=reject' in dns_security.dmarc_record.lower() and 
+                dns_security.has_dkim and dns_security.dkim_valid)
+
+    def _get_enhanced_verdict(self, score: int, category_scores: Dict[str, int]) -> str:
+        if score >= 85:  # Reduced from 90
+            return "Excellent"
+        elif score >= 75:  # Reduced from 80
+            lowest_category = min(category_scores.values())
+            return "Very Good" if lowest_category >= 50 else f"Very Good (Needs attention in {self._get_lowest_category(category_scores)})"
+        elif score >= 65:  # Reduced from 70
+            return "Good"
+        elif score >= 55:  # Reduced from 60
+            return "Fair"
+        elif score >= 45:  # Reduced from 50
+            return "Needs Improvement"
+        elif score >= 25:  # Reduced from 30
+            return "Poor"
+        else:
+            return "Critical Issues"
+
+    def _get_enhanced_confidence(self, score: int, smtp_check: bool, has_mx: bool) -> str:
+        if not smtp_check or not has_mx:
+            return "Very Low"
+        if score >= 85:  # Updated thresholds to match new scoring
+            return "Very High"
+        elif score >= 70:
+            return "High"
+        elif score >= 55:
+            return "Medium"
+        elif score >= 35:
+            return "Low"
+        else:
+            return "Very Low"
+
+    def _get_lowest_category(self, category_scores: Dict[str, int]) -> str:
+        return min(category_scores.items(), key=lambda x: x[1])[0]
+----------------------------------------
+
+File: smtp_pool.py
+
+import smtplib
+import time
+from typing import Dict, Optional, Tuple, List
+from threading import Lock
+import logging
+import socket
+from config import SMTP_CONFIG
+
+class SMTPConnection:
+    """Represents a single SMTP connection with metadata and health tracking"""
+
+    def __init__(self, host: str, port: int = 25, timeout: int = SMTP_CONFIG['TIMEOUT']):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.connection: Optional[smtplib.SMTP] = None
+        self.last_used: float = 0
+        self.created_at: float = time.time()
+        self.use_count: int = 0
+        self.is_busy: bool = False
+        self.error_count: int = 0
+        self.last_error: Optional[str] = None
+
+    def connect(self) -> bool:
+        """
+        Establish SMTP connection with retry logic
+
+        Returns:
+            bool: Whether connection was successful
+        """
+        for attempt in range(SMTP_CONFIG['RETRY_COUNT']):
+            try:
+                self.connection = smtplib.SMTP(timeout=self.timeout)
+                self.connection.connect(self.host, self.port)
+                # Try EHLO/HELO
+                try:
+                    self.connection.ehlo()
+                except:
+                    try:
+                        self.connection.helo()
+                    except:
+                        pass
+                self.last_used = time.time()
+                self.error_count = 0
+                self.last_error = None
+                return True
+            except Exception as e:
+                self.last_error = str(e)
+                self.error_count += 1
+                if attempt < SMTP_CONFIG['RETRY_COUNT'] - 1:
+                    time.sleep(SMTP_CONFIG['RETRY_DELAY'])
+                continue
+        return False
+
+    def disconnect(self) -> None:
+        """Safely close SMTP connection"""
+        try:
+            if self.connection:
+                self.connection.quit()
+        except:
+            pass
+        finally:
+            self.connection = None
+
+    def is_connected(self) -> bool:
+        """
+        Check if connection is still alive using NOOP
+
+        Returns:
+            bool: Whether connection is responsive
+        """
+        if not self.connection:
+            return False
+        try:
+            status = self.connection.noop()[0]
+            return status == 250
+        except:
+            return False
+
+    def refresh_if_needed(self, max_age: int = SMTP_CONFIG['MAX_AGE']) -> bool:
+        """
+        Refresh connection if it's too old or unresponsive
+
+        Args:
+            max_age: Maximum age in seconds before refresh
+
+        Returns:
+            bool: Whether connection is now valid
+        """
+        if (time.time() - self.last_used > max_age) or not self.is_connected():
+            self.disconnect()
+            return self.connect()
+        return True
+
+class SMTPConnectionPool:
+    """Manages a pool of SMTP connections with health monitoring"""
+
+    def __init__(self, 
+                 max_connections: int = SMTP_CONFIG['MAX_CONNECTIONS'],
+                 connection_timeout: int = SMTP_CONFIG['CONNECTION_TIMEOUT'],
+                 max_age: int = SMTP_CONFIG['MAX_AGE']):
+        self.max_connections = max_connections
+        self.connection_timeout = connection_timeout
+        self.max_age = max_age
+        self.connections: Dict[str, List[SMTPConnection]] = {}
+        self.lock = Lock()
+        self.logger = logging.getLogger('smtp_pool')
+
+    def _get_connection_key(self, host: str, port: int = 25) -> str:
+        """Generate unique key for connection storage"""
+        return f"{host}:{port}"
+
+    def get_connection(self, host: str, port: int = 25) -> Optional[SMTPConnection]:
+        """
+        Get an available connection from the pool
+
+        Args:
+            host: SMTP host
+            port: SMTP port
+
+        Returns:
+            SMTPConnection if available, None otherwise
+        """
+        key = self._get_connection_key(host, port)
+
+        with self.lock:
+            # Initialize connection list if needed
+            if key not in self.connections:
+                self.connections[key] = []
+
+            # Try to find an available connection
+            for conn in self.connections[key]:
+                if not conn.is_busy:
+                    if conn.refresh_if_needed(self.max_age):
+                        conn.is_busy = True
+                        conn.use_count += 1
+                        conn.last_used = time.time()
+                        return conn
+                    else:
+                        # Remove failed connection
+                        conn.disconnect()
+                        self.connections[key].remove(conn)
+
+            # Create new connection if pool isn't full
+            if len(self.connections[key]) < self.max_connections:
+                conn = SMTPConnection(host, port, self.connection_timeout)
+                if conn.connect():
+                    conn.is_busy = True
+                    self.connections[key].append(conn)
+                    return conn
+                else:
+                    self.logger.warning(f"Failed to create new connection to {host}:{port}")
+
+            self.logger.warning(f"No available connections for {host}:{port}")
+            return None
+
+    def release_connection(self, conn: SMTPConnection) -> None:
+        """
+        Release connection back to the pool
+
+        Args:
+            conn: Connection to release
+        """
+        with self.lock:
+            conn.is_busy = False
+            conn.last_used = time.time()
+
+    def cleanup(self, force: bool = False) -> None:
+        """
+        Remove dead or old connections
+
+        Args:
+            force: Whether to remove all connections
+        """
+        with self.lock:
+            for key in list(self.connections.keys()):
+                for conn in self.connections[key][:]:
+                    if force or time.time() - conn.last_used > self.max_age or not conn.is_connected():
+                        conn.disconnect()
+                        self.connections[key].remove(conn)
+
+    def get_pool_stats(self) -> Dict:
+        """
+        Get current pool statistics
+
+        Returns:
+            Dict containing pool statistics
+        """
+        stats = {
+            'total_connections': 0,
+            'active_connections': 0,
+            'connections_by_host': {},
+            'error_rates': {}
+        }
+
+        with self.lock:
+            for key, conns in self.connections.items():
+                host_stats = {
+                    'total': len(conns),
+                    'active': sum(1 for c in conns if c.is_busy),
+                    'errors': sum(c.error_count for c in conns)
+                }
+                stats['connections_by_host'][key] = host_stats
+                stats['total_connections'] += host_stats['total']
+                stats['active_connections'] += host_stats['active']
+                if host_stats['total'] > 0:
+                    stats['error_rates'][key] = host_stats['errors'] / host_stats['total']
+
+        return stats
+
+# Global connection pool instance
+smtp_pool = SMTPConnectionPool()
+
+class SMTPContext:
+    """Context manager for SMTP connections"""
+
+    def __init__(self, host: str, port: int = 25):
+        self.host = host
+        self.port = port
+        self.connection = None
+
+    def __enter__(self) -> Optional[SMTPConnection]:
+        self.connection = smtp_pool.get_connection(self.host, self.port)
+        return self.connection
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.connection:
+            smtp_pool.release_connection(self.connection)
+
+def verify_email_with_pool(email: str, mx_records: List[str]) -> Tuple[bool, str]:
+    """
+    Helper function to verify email using connection pool
+
+    Args:
+        email: Email address to verify
+        mx_records: List of MX records to try
+
+    Returns:
+        Tuple containing:
+        - bool: Whether verification was successful
+        - str: Status message
+    """
+    for mx in mx_records[:2]:  # Try first two MX records
+        try:
+            with SMTPContext(mx) as conn:
+                if not conn or not conn.connection:
+                    continue
+
+                # Try email verification
+                try:
+                    conn.connection.mail('')
+                    code, message = conn.connection.rcpt(email)
+                    if code == 250:
+                        return True, "Email exists"
+                    elif code == 550:
+                        return False, "Mailbox does not exist"
+                    elif code in [421, 450, 451, 452]:
+                        return True, "Server temporarily unavailable"
+                except smtplib.SMTPServerDisconnected:
+                    continue
+                except smtplib.SMTPResponseException as e:
+                    if e.smtp_code in [421, 450, 451, 452]:
+                        return True, "Server temporarily unavailable"
+                    continue
+
+        except Exception as e:
+            logging.error(f"SMTP verification error for {mx}: {str(e)}")
+            continue
+
+    return False, "Could not verify email"
+----------------------------------------
+
+File: uv.lock
+
+version = 1
+requires-python = ">=3.11"
+
+[[package]]
+name = "blinker"
+version = "1.9.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/21/28/9b3f50ce0e048515135495f198351908d99540d69bfdc8c1d15b73dc55ce/blinker-1.9.0.tar.gz", hash = "sha256:b4ce2265a7abece45e7cc896e98dbebe6cead56bcf805a3d23136d145f5445bf", size = 22460 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/10/cb/f2ad4230dc2eb1a74edf38f1a38b9b52277f75bef262d8908e60d957e13c/blinker-1.9.0-py3-none-any.whl", hash = "sha256:ba0efaa9080b619ff2f3459d1d500c57bddea4a6b424b60a91141db6fd2f08bc", size = 8458 },
+]
+
+[[package]]
+name = "cachetools"
+version = "5.5.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c3/38/a0f315319737ecf45b4319a8cd1f3a908e29d9277b46942263292115eee7/cachetools-5.5.0.tar.gz", hash = "sha256:2cc24fb4cbe39633fb7badd9db9ca6295d766d9c2995f245725a46715d050f2a", size = 27661 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a4/07/14f8ad37f2d12a5ce41206c21820d8cb6561b728e51fad4530dff0552a67/cachetools-5.5.0-py3-none-any.whl", hash = "sha256:02134e8439cdc2ffb62023ce1debca2944c3f289d66bb17ead3ab3dede74b292", size = 9524 },
+]
+
+[[package]]
+name = "click"
+version = "8.1.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "platform_system == 'Windows'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/96/d3/f04c7bfcf5c1862a2a5b845c6b2b360488cf47af55dfa79c98f6a6bf98b5/click-8.1.7.tar.gz", hash = "sha256:ca9853ad459e787e2192211578cc907e7594e294c7ccc834310722b41b9ca6de", size = 336121 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/00/2e/d53fa4befbf2cfa713304affc7ca780ce4fc1fd8710527771b58311a3229/click-8.1.7-py3-none-any.whl", hash = "sha256:ae74fb96c20a0277a1d615f1e4d73c8414f5a98db8b799a7931d1582f3390c28", size = 97941 },
+]
+
+[[package]]
+name = "colorama"
+version = "0.4.6"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d8/53/6f443c9a4a8358a93a6792e2acffb9d9d5cb0a5cfd8802644b7b1c9a02e4/colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44", size = 27697 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335 },
+]
+
+[[package]]
+name = "dnspython"
+version = "2.7.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b5/4a/263763cb2ba3816dd94b08ad3a33d5fdae34ecb856678773cc40a3605829/dnspython-2.7.0.tar.gz", hash = "sha256:ce9c432eda0dc91cf618a5cedf1a4e142651196bbcd2c80e89ed5a907e5cfaf1", size = 345197 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/68/1b/e0a87d256e40e8c888847551b20a017a6b98139178505dc7ffb96f04e954/dnspython-2.7.0-py3-none-any.whl", hash = "sha256:b4c34b7d10b51bcc3a5071e7b8dee77939f1e878477eeecc965e9835f63c6c86", size = 313632 },
+]
+
+[[package]]
+name = "email-validator"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "dnspython" },
+    { name = "idna" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/48/ce/13508a1ec3f8bb981ae4ca79ea40384becc868bfae97fd1c942bb3a001b1/email_validator-2.2.0.tar.gz", hash = "sha256:cb690f344c617a714f22e66ae771445a1ceb46821152df8e165c5f9a364582b7", size = 48967 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d7/ee/bf0adb559ad3c786f12bcbc9296b3f5675f529199bef03e2df281fa1fadb/email_validator-2.2.0-py3-none-any.whl", hash = "sha256:561977c2d73ce3611850a06fa56b414621e0c8faa9d66f2611407d87465da631", size = 33521 },
+]
+
+[[package]]
+name = "flask"
+version = "3.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "blinker" },
+    { name = "click" },
+    { name = "itsdangerous" },
+    { name = "jinja2" },
+    { name = "werkzeug" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/89/50/dff6380f1c7f84135484e176e0cac8690af72fa90e932ad2a0a60e28c69b/flask-3.1.0.tar.gz", hash = "sha256:5f873c5184c897c8d9d1b05df1e3d01b14910ce69607a117bd3277098a5836ac", size = 680824 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/af/47/93213ee66ef8fae3b93b3e29206f6b251e65c97bd91d8e1c5596ef15af0a/flask-3.1.0-py3-none-any.whl", hash = "sha256:d667207822eb83f1c4b50949b1623c8fc8d51f2341d65f72e1a1815397551136", size = 102979 },
+]
+
+[[package]]
+name = "idna"
+version = "3.10"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f1/70/7703c29685631f5a7590aa73f1f1d3fa9a380e654b86af429e0934a32f7d/idna-3.10.tar.gz", hash = "sha256:12f65c9b470abda6dc35cf8e63cc574b1c52b11df2c86030af0ac09b01b13ea9", size = 190490 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/76/c6/c88e154df9c4e1a2a66ccf0005a88dfb2650c1dffb6f5ce603dfbd452ce3/idna-3.10-py3-none-any.whl", hash = "sha256:946d195a0d259cbba61165e88e65941f16e9b36ea6ddb97f00452bae8b1287d3", size = 70442 },
+]
+
+[[package]]
+name = "itsdangerous"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9c/cb/8ac0172223afbccb63986cc25049b154ecfb5e85932587206f42317be31d/itsdangerous-2.2.0.tar.gz", hash = "sha256:e0050c0b7da1eea53ffaf149c0cfbb5c6e2e2b69c4bef22c81fa6eb73e5f6173", size = 54410 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/04/96/92447566d16df59b2a776c0fb82dbc4d9e07cd95062562af01e408583fc4/itsdangerous-2.2.0-py3-none-any.whl", hash = "sha256:c6242fc49e35958c8b15141343aa660db5fc54d4f13a1db01a3f5891b98700ef", size = 16234 },
+]
+
+[[package]]
+name = "jinja2"
+version = "3.1.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "markupsafe" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ed/55/39036716d19cab0747a5020fc7e907f362fbf48c984b14e62127f7e68e5d/jinja2-3.1.4.tar.gz", hash = "sha256:4a3aee7acbbe7303aede8e9648d13b8bf88a429282aa6122a993f0ac800cb369", size = 240245 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/31/80/3a54838c3fb461f6fec263ebf3a3a41771bd05190238de3486aae8540c36/jinja2-3.1.4-py3-none-any.whl", hash = "sha256:bc5dd2abb727a5319567b7a813e6a2e7318c39f4f487cfe6c89c6f9c7d25197d", size = 133271 },
+]
+
+[[package]]
+name = "markupsafe"
+version = "3.0.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b2/97/5d42485e71dfc078108a86d6de8fa46db44a1a9295e89c5d6d4a06e23a62/markupsafe-3.0.2.tar.gz", hash = "sha256:ee55d3edf80167e48ea11a923c7386f4669df67d7994554387f84e7d8b0a2bf0", size = 20537 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6b/28/bbf83e3f76936960b850435576dd5e67034e200469571be53f69174a2dfd/MarkupSafe-3.0.2-cp311-cp311-macosx_10_9_universal2.whl", hash = "sha256:9025b4018f3a1314059769c7bf15441064b2207cb3f065e6ea1e7359cb46db9d", size = 14353 },
+    { url = "https://files.pythonhosted.org/packages/6c/30/316d194b093cde57d448a4c3209f22e3046c5bb2fb0820b118292b334be7/MarkupSafe-3.0.2-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:93335ca3812df2f366e80509ae119189886b0f3c2b81325d39efdb84a1e2ae93", size = 12392 },
+    { url = "https://files.pythonhosted.org/packages/f2/96/9cdafba8445d3a53cae530aaf83c38ec64c4d5427d975c974084af5bc5d2/MarkupSafe-3.0.2-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:2cb8438c3cbb25e220c2ab33bb226559e7afb3baec11c4f218ffa7308603c832", size = 23984 },
+    { url = "https://files.pythonhosted.org/packages/f1/a4/aefb044a2cd8d7334c8a47d3fb2c9f328ac48cb349468cc31c20b539305f/MarkupSafe-3.0.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:a123e330ef0853c6e822384873bef7507557d8e4a082961e1defa947aa59ba84", size = 23120 },
+    { url = "https://files.pythonhosted.org/packages/8d/21/5e4851379f88f3fad1de30361db501300d4f07bcad047d3cb0449fc51f8c/MarkupSafe-3.0.2-cp311-cp311-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:1e084f686b92e5b83186b07e8a17fc09e38fff551f3602b249881fec658d3eca", size = 23032 },
+    { url = "https://files.pythonhosted.org/packages/00/7b/e92c64e079b2d0d7ddf69899c98842f3f9a60a1ae72657c89ce2655c999d/MarkupSafe-3.0.2-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:d8213e09c917a951de9d09ecee036d5c7d36cb6cb7dbaece4c71a60d79fb9798", size = 24057 },
+    { url = "https://files.pythonhosted.org/packages/f9/ac/46f960ca323037caa0a10662ef97d0a4728e890334fc156b9f9e52bcc4ca/MarkupSafe-3.0.2-cp311-cp311-musllinux_1_2_i686.whl", hash = "sha256:5b02fb34468b6aaa40dfc198d813a641e3a63b98c2b05a16b9f80b7ec314185e", size = 23359 },
+    { url = "https://files.pythonhosted.org/packages/69/84/83439e16197337b8b14b6a5b9c2105fff81d42c2a7c5b58ac7b62ee2c3b1/MarkupSafe-3.0.2-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:0bff5e0ae4ef2e1ae4fdf2dfd5b76c75e5c2fa4132d05fc1b0dabcd20c7e28c4", size = 23306 },
+    { url = "https://files.pythonhosted.org/packages/9a/34/a15aa69f01e2181ed8d2b685c0d2f6655d5cca2c4db0ddea775e631918cd/MarkupSafe-3.0.2-cp311-cp311-win32.whl", hash = "sha256:6c89876f41da747c8d3677a2b540fb32ef5715f97b66eeb0c6b66f5e3ef6f59d", size = 15094 },
+    { url = "https://files.pythonhosted.org/packages/da/b8/3a3bd761922d416f3dc5d00bfbed11f66b1ab89a0c2b6e887240a30b0f6b/MarkupSafe-3.0.2-cp311-cp311-win_amd64.whl", hash = "sha256:70a87b411535ccad5ef2f1df5136506a10775d267e197e4cf531ced10537bd6b", size = 15521 },
+    { url = "https://files.pythonhosted.org/packages/22/09/d1f21434c97fc42f09d290cbb6350d44eb12f09cc62c9476effdb33a18aa/MarkupSafe-3.0.2-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:9778bd8ab0a994ebf6f84c2b949e65736d5575320a17ae8984a77fab08db94cf", size = 14274 },
+    { url = "https://files.pythonhosted.org/packages/6b/b0/18f76bba336fa5aecf79d45dcd6c806c280ec44538b3c13671d49099fdd0/MarkupSafe-3.0.2-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:846ade7b71e3536c4e56b386c2a47adf5741d2d8b94ec9dc3e92e5e1ee1e2225", size = 12348 },
+    { url = "https://files.pythonhosted.org/packages/e0/25/dd5c0f6ac1311e9b40f4af06c78efde0f3b5cbf02502f8ef9501294c425b/MarkupSafe-3.0.2-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:1c99d261bd2d5f6b59325c92c73df481e05e57f19837bdca8413b9eac4bd8028", size = 24149 },
+    { url = "https://files.pythonhosted.org/packages/f3/f0/89e7aadfb3749d0f52234a0c8c7867877876e0a20b60e2188e9850794c17/MarkupSafe-3.0.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:e17c96c14e19278594aa4841ec148115f9c7615a47382ecb6b82bd8fea3ab0c8", size = 23118 },
+    { url = "https://files.pythonhosted.org/packages/d5/da/f2eeb64c723f5e3777bc081da884b414671982008c47dcc1873d81f625b6/MarkupSafe-3.0.2-cp312-cp312-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:88416bd1e65dcea10bc7569faacb2c20ce071dd1f87539ca2ab364bf6231393c", size = 22993 },
+    { url = "https://files.pythonhosted.org/packages/da/0e/1f32af846df486dce7c227fe0f2398dc7e2e51d4a370508281f3c1c5cddc/MarkupSafe-3.0.2-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:2181e67807fc2fa785d0592dc2d6206c019b9502410671cc905d132a92866557", size = 24178 },
+    { url = "https://files.pythonhosted.org/packages/c4/f6/bb3ca0532de8086cbff5f06d137064c8410d10779c4c127e0e47d17c0b71/MarkupSafe-3.0.2-cp312-cp312-musllinux_1_2_i686.whl", hash = "sha256:52305740fe773d09cffb16f8ed0427942901f00adedac82ec8b67752f58a1b22", size = 23319 },
+    { url = "https://files.pythonhosted.org/packages/a2/82/8be4c96ffee03c5b4a034e60a31294daf481e12c7c43ab8e34a1453ee48b/MarkupSafe-3.0.2-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:ad10d3ded218f1039f11a75f8091880239651b52e9bb592ca27de44eed242a48", size = 23352 },
+    { url = "https://files.pythonhosted.org/packages/51/ae/97827349d3fcffee7e184bdf7f41cd6b88d9919c80f0263ba7acd1bbcb18/MarkupSafe-3.0.2-cp312-cp312-win32.whl", hash = "sha256:0f4ca02bea9a23221c0182836703cbf8930c5e9454bacce27e767509fa286a30", size = 15097 },
+    { url = "https://files.pythonhosted.org/packages/c1/80/a61f99dc3a936413c3ee4e1eecac96c0da5ed07ad56fd975f1a9da5bc630/MarkupSafe-3.0.2-cp312-cp312-win_amd64.whl", hash = "sha256:8e06879fc22a25ca47312fbe7c8264eb0b662f6db27cb2d3bbbc74b1df4b9b87", size = 15601 },
+    { url = "https://files.pythonhosted.org/packages/83/0e/67eb10a7ecc77a0c2bbe2b0235765b98d164d81600746914bebada795e97/MarkupSafe-3.0.2-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:ba9527cdd4c926ed0760bc301f6728ef34d841f405abf9d4f959c478421e4efd", size = 14274 },
+    { url = "https://files.pythonhosted.org/packages/2b/6d/9409f3684d3335375d04e5f05744dfe7e9f120062c9857df4ab490a1031a/MarkupSafe-3.0.2-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:f8b3d067f2e40fe93e1ccdd6b2e1d16c43140e76f02fb1319a05cf2b79d99430", size = 12352 },
+    { url = "https://files.pythonhosted.org/packages/d2/f5/6eadfcd3885ea85fe2a7c128315cc1bb7241e1987443d78c8fe712d03091/MarkupSafe-3.0.2-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:569511d3b58c8791ab4c2e1285575265991e6d8f8700c7be0e88f86cb0672094", size = 24122 },
+    { url = "https://files.pythonhosted.org/packages/0c/91/96cf928db8236f1bfab6ce15ad070dfdd02ed88261c2afafd4b43575e9e9/MarkupSafe-3.0.2-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:15ab75ef81add55874e7ab7055e9c397312385bd9ced94920f2802310c930396", size = 23085 },
+    { url = "https://files.pythonhosted.org/packages/c2/cf/c9d56af24d56ea04daae7ac0940232d31d5a8354f2b457c6d856b2057d69/MarkupSafe-3.0.2-cp313-cp313-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:f3818cb119498c0678015754eba762e0d61e5b52d34c8b13d770f0719f7b1d79", size = 22978 },
+    { url = "https://files.pythonhosted.org/packages/2a/9f/8619835cd6a711d6272d62abb78c033bda638fdc54c4e7f4272cf1c0962b/MarkupSafe-3.0.2-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:cdb82a876c47801bb54a690c5ae105a46b392ac6099881cdfb9f6e95e4014c6a", size = 24208 },
+    { url = "https://files.pythonhosted.org/packages/f9/bf/176950a1792b2cd2102b8ffeb5133e1ed984547b75db47c25a67d3359f77/MarkupSafe-3.0.2-cp313-cp313-musllinux_1_2_i686.whl", hash = "sha256:cabc348d87e913db6ab4aa100f01b08f481097838bdddf7c7a84b7575b7309ca", size = 23357 },
+    { url = "https://files.pythonhosted.org/packages/ce/4f/9a02c1d335caabe5c4efb90e1b6e8ee944aa245c1aaaab8e8a618987d816/MarkupSafe-3.0.2-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:444dcda765c8a838eaae23112db52f1efaf750daddb2d9ca300bcae1039adc5c", size = 23344 },
+    { url = "https://files.pythonhosted.org/packages/ee/55/c271b57db36f748f0e04a759ace9f8f759ccf22b4960c270c78a394f58be/MarkupSafe-3.0.2-cp313-cp313-win32.whl", hash = "sha256:bcf3e58998965654fdaff38e58584d8937aa3096ab5354d493c77d1fdd66d7a1", size = 15101 },
+    { url = "https://files.pythonhosted.org/packages/29/88/07df22d2dd4df40aba9f3e402e6dc1b8ee86297dddbad4872bd5e7b0094f/MarkupSafe-3.0.2-cp313-cp313-win_amd64.whl", hash = "sha256:e6a2a455bd412959b57a172ce6328d2dd1f01cb2135efda2e4576e8a23fa3b0f", size = 15603 },
+    { url = "https://files.pythonhosted.org/packages/62/6a/8b89d24db2d32d433dffcd6a8779159da109842434f1dd2f6e71f32f738c/MarkupSafe-3.0.2-cp313-cp313t-macosx_10_13_universal2.whl", hash = "sha256:b5a6b3ada725cea8a5e634536b1b01c30bcdcd7f9c6fff4151548d5bf6b3a36c", size = 14510 },
+    { url = "https://files.pythonhosted.org/packages/7a/06/a10f955f70a2e5a9bf78d11a161029d278eeacbd35ef806c3fd17b13060d/MarkupSafe-3.0.2-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:a904af0a6162c73e3edcb969eeeb53a63ceeb5d8cf642fade7d39e7963a22ddb", size = 12486 },
+    { url = "https://files.pythonhosted.org/packages/34/cf/65d4a571869a1a9078198ca28f39fba5fbb910f952f9dbc5220afff9f5e6/MarkupSafe-3.0.2-cp313-cp313t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:4aa4e5faecf353ed117801a068ebab7b7e09ffb6e1d5e412dc852e0da018126c", size = 25480 },
+    { url = "https://files.pythonhosted.org/packages/0c/e3/90e9651924c430b885468b56b3d597cabf6d72be4b24a0acd1fa0e12af67/MarkupSafe-3.0.2-cp313-cp313t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c0ef13eaeee5b615fb07c9a7dadb38eac06a0608b41570d8ade51c56539e509d", size = 23914 },
+    { url = "https://files.pythonhosted.org/packages/66/8c/6c7cf61f95d63bb866db39085150df1f2a5bd3335298f14a66b48e92659c/MarkupSafe-3.0.2-cp313-cp313t-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:d16a81a06776313e817c951135cf7340a3e91e8c1ff2fac444cfd75fffa04afe", size = 23796 },
+    { url = "https://files.pythonhosted.org/packages/bb/35/cbe9238ec3f47ac9a7c8b3df7a808e7cb50fe149dc7039f5f454b3fba218/MarkupSafe-3.0.2-cp313-cp313t-musllinux_1_2_aarch64.whl", hash = "sha256:6381026f158fdb7c72a168278597a5e3a5222e83ea18f543112b2662a9b699c5", size = 25473 },
+    { url = "https://files.pythonhosted.org/packages/e6/32/7621a4382488aa283cc05e8984a9c219abad3bca087be9ec77e89939ded9/MarkupSafe-3.0.2-cp313-cp313t-musllinux_1_2_i686.whl", hash = "sha256:3d79d162e7be8f996986c064d1c7c817f6df3a77fe3d6859f6f9e7be4b8c213a", size = 24114 },
+    { url = "https://files.pythonhosted.org/packages/0d/80/0985960e4b89922cb5a0bac0ed39c5b96cbc1a536a99f30e8c220a996ed9/MarkupSafe-3.0.2-cp313-cp313t-musllinux_1_2_x86_64.whl", hash = "sha256:131a3c7689c85f5ad20f9f6fb1b866f402c445b220c19fe4308c0b147ccd2ad9", size = 24098 },
+    { url = "https://files.pythonhosted.org/packages/82/78/fedb03c7d5380df2427038ec8d973587e90561b2d90cd472ce9254cf348b/MarkupSafe-3.0.2-cp313-cp313t-win32.whl", hash = "sha256:ba8062ed2cf21c07a9e295d5b8a2a5ce678b913b45fdf68c32d95d6c1291e0b6", size = 15208 },
+    { url = "https://files.pythonhosted.org/packages/4f/65/6079a46068dfceaeabb5dcad6d674f5f5c61a6fa5673746f42a9f4c233b3/MarkupSafe-3.0.2-cp313-cp313t-win_amd64.whl", hash = "sha256:e444a31f8db13eb18ada366ab3cf45fd4b31e4db1236a4448f68778c1d1a5a2f", size = 15739 },
+]
+
+[[package]]
+name = "python-template"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "cachetools" },
+    { name = "dnspython" },
+    { name = "email-validator" },
+    { name = "flask" },
+    { name = "idna" },
+    { name = "whois" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cachetools", specifier = ">=5.5.0" },
+    { name = "dnspython", specifier = ">=2.7.0" },
+    { name = "email-validator", specifier = ">=2.2.0" },
+    { name = "flask", specifier = ">=3.1.0" },
+    { name = "idna", specifier = ">=3.10" },
+    { name = "whois", specifier = ">=1.20240129.2" },
+]
+
+[[package]]
+name = "werkzeug"
+version = "3.1.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "markupsafe" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9f/69/83029f1f6300c5fb2471d621ab06f6ec6b3324685a2ce0f9777fd4a8b71e/werkzeug-3.1.3.tar.gz", hash = "sha256:60723ce945c19328679790e3282cc758aa4a6040e4bb330f53d30fa546d44746", size = 806925 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/52/24/ab44c871b0f07f491e5d2ad12c9bd7358e527510618cb1b803a88e986db1/werkzeug-3.1.3-py3-none-any.whl", hash = "sha256:54b78bf3716d19a65be4fceccc0d1d7b89e608834989dfae50ea87564639213e", size = 224498 },
+]
+
+[[package]]
+name = "whois"
+version = "1.20240129.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/98/58/2eaac98a891e1c25b4be1b339376284100473ebc4101508c4d25a9c18dec/whois-1.20240129.2.tar.gz", hash = "sha256:b81367d0d1d6b742a7d0a7f8403acb246a57cd7b9bf934d825cf1cdf67cef284", size = 49306 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0b/d0/9159c4c27de3ba76b5e253b8d9119d3fc2cb4617e1e5bd0cd0302b7a27a7/whois-1.20240129.2-py3-none-any.whl", hash = "sha256:1a7924e8ac1c534c326e5f1f3bd7975197d1a84dc968a9ce972b437cee494ba7", size = 61834 },
+]
+
+----------------------------------------
+
+File: pyproject.toml
+
+[project]
+name = "python-template"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+requires-python = ">=3.11"
+dependencies = [
+    "cachetools>=5.5.0",
+    "dnspython>=2.7.0",
+    "email-validator>=2.2.0",
+    "flask>=3.1.0",
+    "idna>=3.10",
+    "whois>=1.20240129.2",
+]
+
+----------------------------------------
+
+File: .replit
+
+entrypoint = "app.py"
+modules = ["python-3.11"]
+
+[nix]
+channel = "stable-24_05"
+
+[unitTest]
+language = "python3"
+
+[gitHubImport]
+requiredFiles = [".replit", "replit.nix"]
+
+[deployment]
+run = ["python3", "app.py"]
+deploymentTarget = "cloudrun"
+
+[[ports]]
+localPort = 8080
+externalPort = 80
+
+----------------------------------------
+
+File: replit.nix
+
+{pkgs}: {
+  deps = [
+    pkgs.inetutils
+    pkgs.cacert
+  ];
+}
+
+----------------------------------------
+

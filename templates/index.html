@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced Email Validator</title>
+    <style>
+        :root {
+            --primary-color: #4CAF50;
+            --danger-color: #dc3545;
+            --warning-color: #ffc107;
+            --success-color: #28a745;
+            --text-color: #333;
+            --border-color: #ddd;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Arial', sans-serif;
+            line-height: 1.6;
+            color: var(--text-color);
+            background-color: #f5f5f5;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            color: #2c3e50;
+        }
+
+        .tabs {
+            display: flex;
+            margin-bottom: 30px;
+            border-bottom: 2px solid var(--border-color);
+        }
+
+        .tab {
+            padding: 12px 24px;
+            cursor: pointer;
+            border: none;
+            background: none;
+            font-size: 16px;
+            position: relative;
+            color: #666;
+            transition: all 0.3s ease;
+        }
+
+        .tab.active {
+            color: var(--primary-color);
+        }
+
+        .tab:hover {
+            color: var(--primary-color);
+            background-color: rgba(76, 175, 80, 0.05);
+        }
+
+        .tab.active::after {
+            content: '';
+            position: absolute;
+            bottom: -2px;
+            left: 0;
+            width: 100%;
+            height: 2px;
+            background-color: var(--primary-color);
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .input-group {
+            margin-bottom: 30px;
+        }
+
+        input[type="email"] {
+            width: 100%;
+            padding: 12px;
+            font-size: 16px;
+            border: 2px solid var(--border-color);
+            border-radius: 4px;
+            transition: all 0.3s ease;
+            margin-bottom: 15px;
+        }
+
+        input[type="email"]:focus {
+            border-color: var(--primary-color);
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(76, 175, 80, 0.2);
+        }
+
+        .validate-btn {
+            background-color: var(--primary-color);
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            width: 100%;
+            transition: all 0.3s ease;
+        }
+
+        .validate-btn:hover {
+            background-color: #3d8b40;
+        }
+
+        .bulk-upload-section {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .file-upload {
+            border: 2px dashed var(--border-color);
+            padding: 30px;
+            text-align: center;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .file-upload:hover {
+            border-color: var(--primary-color);
+            background-color: rgba(76, 175, 80, 0.05);
+        }
+
+        .file-upload p {
+            margin: 10px 0;
+            color: #666;
+        }
+
+        .file-upload .small {
+            font-size: 14px;
+            color: #999;
+        }
+
+        #file-info {
+            margin: 15px 0;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+
+        .loader {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(255, 255, 255, 0.8);
+            z-index: 1000;
+        }
+
+        .loader-content {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+        }
+
+        .spinner {
+            width: 40px;
+            height: 40px;
+            margin: 0 auto 10px;
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid var(--primary-color);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .quick-result {
+            background-color: white;
+            border-radius: 8px;
+            padding: 30px;
+            margin-top: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .score-section {
+            background-color: white;
+            border-radius: 8px;
+            padding: 30px;
+            text-align: center;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .score-number {
+            font-size: 48px;
+            font-weight: bold;
+            margin: 20px 0;
+        }
+
+        .score-excellent { color: var(--success-color); }
+        .score-good { color: var(--primary-color); }
+        .score-fair { color: var(--warning-color); }
+        .score-poor { color: var(--danger-color); }
+
+        .status-badge {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 500;
+            display: inline-block;
+        }
+
+        .status-badge.valid {
+            background-color: var(--success-color);
+            color: white;
+        }
+
+        .status-badge.warning {
+            background-color: var(--warning-color);
+            color: #333;
+        }
+
+        .status-badge.invalid {
+            background-color: var(--danger-color);
+            color: white;
+        }
+
+        .status-true {
+            background-color: rgba(40, 167, 69, 0.1);
+            color: var(--success-color);
+        }
+
+        .status-false {
+            background-color: rgba(220, 53, 69, 0.1);
+            color: var(--danger-color);
+        }
+
+        .check-section {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .check-title {
+            font-size: 18px;
+            font-weight: bold;
+            padding-bottom: 15px;
+            margin-bottom: 15px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .check-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .check-item:last-child {
+            border-bottom: none;
+        }
+
+        .suggestions {
+            list-style: none;
+            padding: 0;
+        }
+
+        .suggestion-item {
+            padding: 8px 12px;
+            margin: 5px 0;
+            background-color: rgba(255, 193, 7, 0.1);
+            border-left: 4px solid var(--warning-color);
+            border-radius: 0 4px 4px 0;
+        }
+
+        .record-box {
+            background-color: #f8f9fa;
+            padding: 12px;
+            margin-top: 10px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 13px;
+            overflow-x: auto;
+        }
+
+        .record-box pre {
+            margin: 0;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            font-size: 13px;
+            line-height: 1.4;
+        }
+
+        .verification-time {
+            font-size: 14px;
+            color: #666;
+            margin: 10px 0;
+        }
+
+        .blacklist-details {
+            margin-top: 10px;
+            padding: 15px;
+            background-color: rgba(220, 53, 69, 0.1);
+            border-radius: 4px;
+        }
+
+        .blacklist-item {
+            font-family: monospace;
+            margin: 8px 0;
+            padding: 5px 10px;
+            background-color: rgba(255, 255, 255, 0.5);
+            border-radius: 3px;
+        }
+
+        @media (max-width: 600px) {
+            .container {
+                padding: 10px;
+            }
+
+            .score-number {
+                font-size: 36px;
+            }
+
+            .check-section {
+                padding: 15px;
+            }
+
+            .tab {
+                padding: 10px 15px;
+                font-size: 14px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Advanced Email Validator</h1>
+
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('quick')">Quick Validation</button>
+            <button class="tab" onclick="switchTab('security')">Security Analysis</button>
+            <button class="tab" onclick="switchTab('bulk')">Bulk Validation</button>
+        </div>
+
+        <div id="quick-tab" class="tab-content active">
+            <div class="input-group">
+                <input type="email" id="quickEmailInput" placeholder="Enter email address for quick validation" autocomplete="off">
+                <button onclick="validateEmail('quick')" class="validate-btn">Quick Validate</button>
+            </div>
+            <div id="quick-result"></div>
+        </div>
+
+        <div id="security-tab" class="tab-content">
+            <div class="input-group">
+                <input type="email" id="securityEmailInput" placeholder="Enter email address for security analysis" autocomplete="off">
+                <button onclick="validateEmail('detailed')" class="validate-btn">Security Analysis</button>
+            </div>
+            <div id="security-result"></div>
+        </div>
+
+        <div id="bulk-tab" class="tab-content">
+            <div class="bulk-upload-section">
+                <div class="file-upload" onclick="document.getElementById('csvFile').click()">
+                    <input type="file" id="csvFile" accept=".csv" style="display: none" onchange="handleFileSelect()">
+                    <p>📁 Click or drag CSV file here to upload</p>
+                    <p class="small">File must contain an "email" column</p>
+                    <p class="small">Example format: email<br>user@example.com</p>
+                </div>
+                <div id="file-info"></div>
+                <button onclick="validateBulk()" class="validate-btn">Validate All Emails</button>
+            </div>
+            <div id="bulk-result"></div>
+        </div>
+    </div>
+
+    <div class="loader" id="loader">
+        <div class="loader-content">
+            <div class="spinner"></div>
+            <div id="loader-text">Validating email...</div>
+        </div>
+    </div>
+
+    <script>
+        function switchTab(tabName) {
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.remove('active');
+            });
+
+            document.querySelector(`.tab[onclick*="${tabName}"]`).classList.add('active');
+            document.getElementById(`${tabName}-tab`).classList.add('active');
+        }
+
+        function handleFileSelect() {
+            const fileInput = document.getElementById('csvFile');
+            const fileInfo = document.getElementById('file-info');
+
+            if (fileInput.files.length > 0) {
+                const file = fileInput.files[0];
+                fileInfo.innerHTML = `Selected file: ${file.name} (${(file.size / 1024).toFixed(2)} KB)`;
+            }
+        }
+
+        async function validateEmail(type = 'quick') {
+            const emailInput = type === 'quick' ? 'quickEmailInput' : 'securityEmailInput';
+            const resultDiv = type === 'quick' ? 'quick-result' : 'security-result';
+            const email = document.getElementById(emailInput).value;
+            const loader = document.getElementById('loader');
+            const loaderText = document.getElementById('loader-text');
+
+            if (!email) {
+                document.getElementById(resultDiv).innerHTML = '<div class="check-section"><div class="check-title">Error</div><p>Please enter an email address</p></div>';
+                return;
+            }
+
+            loader.style.display = 'block';
+            loaderText.textContent = `${type === 'quick' ? 'Quick validation' : 'Security analysis'} in progress...`;
+
+            try {
+                const response = await fetch('/validate', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ 
+                        email: email,
+                        type: type
+                    })
+                });
+
+                const data = await response.json();
+
+                if (data.error) {
+                    document.getElementById(resultDiv).innerHTML = `
+                        <div class="check-section">
+                            <div class="check-title">Error</div>
+                            <p>${data.error}</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                if (type === 'quick') {
+                    displayQuickResult(data);
+                } else {
+                    displayDetailedResult(data);
+                }
+
+            } catch (error) {
+                document.getElementById(resultDiv).innerHTML = `
+                    <div class="check-section">
+                        <div class="check-title">Error</div>
+                        <p>${error.message || 'Error validating email'}</p>
+                    </div>
+                `;
+            } finally {
+                loader.style.display = 'none';
+            }
+        }
+
+        function displayQuickResult(data) {
+            const resultDiv = document.getElementById('quick-result');
+            const statusClass = data.is_valid ? 'valid' : (data.status.includes('Warning') ? 'warning' : 'invalid');
+
+            let html = `
+                <div class="quick-result">
+                    <div class="status-badge ${statusClass}">
+                        ${data.status}
+                    </div>
+                    <div class="verification-time">Verification Time: ${data.verification_time.toFixed(2)}s</div>
+
+                    <div class="check-section">
+                        <div class="check-title">Validation Results</div>
+                        ${createCheckItems([
+                            ['Format & Syntax', data.has_valid_syntax],
+                            ['Domain Valid', data.domain_valid],
+                            ['Mailbox Exists', data.mailbox_exists],
+                            ['SMTP Valid', data.has_valid_smtp]
+                        ])}
+                    </div>
+
+                    <div class="check-section">
+                        <div class="check-title">Domain Configuration</div>
+                        ${createCheckItems([
+                            ['MX Records Found', data.mx_info?.has_mx || false],
+                            ['Catch-all Domain', data.is_catch_all, true],
+                            ['Parked Domain', data.has_parked_mx, true]
+                        ])}
+                    </div>
+
+                    <div class="check-section">
+                        <div class="check-title">Security Checks</div>
+                        ${createCheckItems([
+                            ['Role Account', data.is_role_account, true],
+                            ['Disposable Email', data.is_disposable, true],
+                            ['Free Provider', data.is_free_email, true],
+                            ['Spam Trap', data.is_honeypot, true]
+                        ])}
+                    </div>
+
+                    ${data.suggestions?.length ? `
+                        <div class="check-section">
+                            <div class="check-title">Suggestions</div>
+                            <ul class="suggestions">
+                                ${data.suggestions.map(s => `<li class="suggestion-item">${s}</li>`).join('')}
+                            </ul>
+                        </div>
+                    ` : ''}
+                </div>`;
+
+            resultDiv.innerHTML = html;
+        }
+
+        function displayDetailedResult(data) {
+            const resultDiv = document.getElementById('security-result');
+            const score = data.score;
+            const scoreClass = getScoreClass(score.score);
+
+            let html = `
+                <div class="score-section">
+                    <div class="score-number ${scoreClass}">${score.score}/100</div>
+                    <div class="verdict">${score.verdict}</div>
+                    <div class="confidence">Confidence: ${score.confidence}</div>
+                    <div class="verification-time">Verification Time: ${data.total_time.toFixed(2)}s</div>
+                </div>
+
+                <div class="check-section">
+                    <div class="check-title">Basic Checks</div>
+                    <div class="check-item">
+                        <span>Format Valid</span>
+                        <span class="status-badge status-${data.format_valid}">${data.format_valid}</span>
+                    </div>
+                    <div class="check-item">
+                        <span>MX Records Found</span>
+                        <span class="status-badge status-${data.mx_check.has_valid_mx}">${data.mx_check.has_valid_mx}</span>
+                    </div>
+                    <div class="check-item">
+                        <span>Email Exists</span>
+                        <span class="status-badge status-${data.smtp_check || data.is_role_account}">${data.smtp_check || data.is_role_account}</span>
+                    </div>
+                    <div class="check-item">
+                        <span>Response Time</span>
+                        <span>${data.mx_check.response_time.toFixed(2)}s</span>
+                    </div>
+                </div>
+
+                <div class="check-section">
+                    <div class="check-title">DNS Security</div>
+                    <div class="check-item">
+                        <span>SPF Record</span>
+                        <span class="status-badge ${data.dns_security.spf_valid ? 'status-true' : 'status-false'}">
+                            ${data.dns_security.spf_valid ? 'Valid' : 'Missing'}
+                        </span>
+                    </div>
+                    <div class="check-item">
+                        <span>DMARC Record</span>
+                        <span class="status-badge ${data.dns_security.dmarc_valid ? 'status-true' : 'status-false'}">
+                            ${data.dns_security.has_dmarc ? (data.dns_security.dmarc_valid ? 'Valid' : 'Present (p=none)') : 'Missing'}
+                        </span>
+                    </div>
+                    <div class="check-item">
+                        <span>DKIM Setup</span>
+                        <span class="status-badge ${data.dns_security.dkim_valid ? 'status-true' : 'status-false'}">
+                            ${data.dns_security.has_dkim ? 'Valid' : 'Missing'}
+                        </span>
+                    </div>
+
+                    <div class="record-box">
+                        <strong>MX Records:</strong>
+                        <pre>${data.dns_security.mx_records ? data.dns_security.mx_records.join('\n') : 'No MX records found'}</pre>
+                    </div>
+
+                    ${data.dns_security.spf_record ? `
+                        <div class="record-box">
+                            <strong>SPF Record:</strong>
+                            <pre>${data.dns_security.spf_record}</pre>
+                        </div>
+                    ` : ''}
+
+                    ${data.dns_security.dmarc_record ? `
+                        <div class="record-box">
+                            <strong>DMARC Record:</strong>
+                            <pre>${data.dns_security.dmarc_record}</pre>
+                        </div>
+                    ` : ''}
+
+                    ${data.dns_security.dkim_record ? `
+                        <div class="record-box">
+                            <strong>DKIM Record:</strong>
+                            <pre>${data.dns_security.dkim_record}</pre>
+                        </div>
+                    ` : ''}
+                </div>
+
+                <div class="check-section">
+                    <div class="check-title">Security Analysis</div>
+                    <div class="check-item">
+                        <span>Domain Reputation</span>
+                        <span class="status-badge ${
+                            data.security_checks.domain_reputation === 'Good' ? 'status-true' : 
+                            data.security_checks.domain_reputation === 'Poor' ? 'status-false' : 'warning'
+                        }">${data.security_checks.domain_reputation}</span>
+                    </div>
+                    <div class="check-item">
+                        <span>Spam Score</span>
+                        <span>${data.security_checks.spam_score}/100</span>
+                    </div>
+                    <div class="check-item">
+                        <span>Abuse Score</span>
+                        <span>${data.security_checks.abuse_score}/100</span>
+                    </div>
+                    <div class="check-item">
+                        <span>Blacklisted</span>
+                        <span class="status-badge status-${!data.security_checks.blacklisted}">${data.security_checks.blacklisted}</span>
+                    </div>
+                    ${data.security_checks.blacklisted ? `
+                        <div class="blacklist-details">
+                            <strong>Listed in the following blacklists:</strong>
+                            ${data.security_checks.blacklist_records.map(record => 
+                                `<div class="blacklist-item">${record}</div>`
+                            ).join('')}
+                        </div>
+                    ` : ''}
+                </div>
+
+                <div class="check-section">
+                    <div class="check-title">Additional Information</div>
+                    <div class="check-item">
+                        <span>Disposable Email</span>
+                        <span class="status-badge status-${!data.is_disposable}">${data.is_disposable}</span>
+                    </div>
+                    <div class="check-item">
+                        <span>Role Account</span>
+                        <span class="status-badge status-${!data.is_role_account}">${data.is_role_account}</span>
+                    </div>
+                    <div class="check-item">
+                        <span>Catch All</span>
+                        <span class="status-badge status-${!data.mx_check.has_catch_all}">${data.mx_check.has_catch_all}</span>
+                    </div>
+                    <div class="check-item">
+                        <span>Free Email Provider</span>
+                        <span class="status-badge status-${!data.is_free_email}">${data.is_free_email}</span>
+                    </div>
+                </div>
+
+                ${data.suggestions && data.suggestions.length ? `
+                    <div class="check-section">
+                        <div class="check-title">Suggestions</div>
+                        <ul class="suggestions">
+                            ${data.suggestions.map(suggestion => 
+                                `<li class="suggestion-item">${suggestion}</li>`
+                            ).join('')}
+                        </ul>
+                    </div>
+                ` : ''}
+            `;
+
+            resultDiv.innerHTML = html;
+        }
+
+        function createCheckItems(items) {
+            return items.map(([label, value, isNegative = false]) => {
+                const statusClass = isNegative ? !value : value;
+                return `
+                    <div class="check-item">
+                        <span>${label}</span>
+                        <span class="status-badge status-${statusClass}">${value}</span>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function getScoreClass(score) {
+            score = Number(score) || 0;
+            if (score >= 90) return 'score-excellent';
+            if (score >= 70) return 'score-good';
+            if (score >= 50) return 'score-fair';
+            return 'score-poor';
+        }
+
+        async function validateBulk() {
+            const fileInput = document.getElementById('csvFile');
+            const resultDiv = document.getElementById('bulk-result');
+            const loader = document.getElementById('loader');
+            const loaderText = document.getElementById('loader-text');
+
+            if (!fileInput.files.length) {
+                resultDiv.innerHTML = '<div class="check-section"><div class="check-title">Error</div><p>Please select a CSV file</p></div>';
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+
+            loader.style.display = 'block';
+            loaderText.textContent = 'Processing CSV file...';
+
+            try {
+                const response = await fetch('/validate-csv', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `validation_results_${new Date().toISOString().split('T')[0]}.csv`;
+                    document.body.appendChild(a);
+                    a.click();
+                    window.URL.revokeObjectURL(url);
+                    a.remove();
+                    resultDiv.innerHTML = '<div class="check-section"><div class="check-title">Success</div><p>Validation complete. Your results have been downloaded.</p></div>';
+                } else {
+                    const error = await response.json();
+                    resultDiv.innerHTML = `<div class="check-section"><div class="check-title">Error</div><p>${error.error}</p></div>`;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `<div class="check-section"><div class="check-title">Error</div><p>${error.message}</p></div>`;
+            } finally {
+                loader.style.display = 'none';
+            }
+        }
+
+        // Add enter key support for input fields
+        document.getElementById('quickEmailInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                validateEmail('quick');
+            }
+        });
+
+        document.getElementById('securityEmailInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+               validateEmail('detailed');
+           }
+       });
+
+       // Add auto-validation after typing stops
+       let typingTimer;
+       const doneTypingInterval = 1000; // 1 second
+
+       document.getElementById('quickEmailInput').addEventListener('input', function() {
+           clearTimeout(typingTimer);
+           if (this.value) {
+               typingTimer = setTimeout(() => validateEmail('quick'), doneTypingInterval);
+           }
+       });
+
+       document.getElementById('securityEmailInput').addEventListener('input', function() {
+           clearTimeout(typingTimer);
+           if (this.value) {
+               typingTimer = setTimeout(() => validateEmail('detailed'), doneTypingInterval);
+           }
+       });
+
+       // Prevent form submission on enter
+       document.addEventListener('submit', function(e) {
+           e.preventDefault();
+           return false;
+       });
+   </script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+[project]
+name = "python-template"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+requires-python = ">=3.11"
+dependencies = [
+    "cachetools>=5.5.0",
+    "dnspython>=2.7.0",
+    "email-validator>=2.2.0",
+    "flask>=3.1.0",
+    "idna>=3.10",
+    "whois>=1.20240129.2",
+]
